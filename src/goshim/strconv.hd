@@ -1,0 +1,146 @@
+## The parts of Go's strconv package that gojq uses: shortest float formatting
+## ('f' and 'e' with precision -1), float and integer parsing, and quoting.
+use std.text.StringBuilder
+
+## The shortest decimal digits of `f` (positive, finite, nonzero) and the
+## position of the decimal point relative to them, from hd's shortest repr.
+fn float_digits(f: f64) -> (string, i32):
+    text := f.to_string()
+    let mantissa = text
+    let exp = +0
+    match text.find("e"):
+        .Some(at) =>
+            mantissa = text.slice(0, at)
+            let e = text.slice(at + 1, text.len())
+            if e.starts_with("+"):
+                e = e.slice(1, e.len())
+            exp = e.parse::[i32]().unwrap_or(0)
+        .None => pass
+    let int_part = mantissa
+    let frac_part = ""
+    match mantissa.find("."):
+        .Some(at) =>
+            int_part = mantissa.slice(0, at)
+            frac_part = mantissa.slice(at + 1, mantissa.len())
+        .None => pass
+    let digits = int_part + frac_part
+    let point = i32(int_part.len()) + exp
+    while digits.len() > 1 && digits.starts_with("0"):
+        digits = digits.slice(1, digits.len())
+        point -= 1
+    while digits.len() > 1 && digits.ends_with("0"):
+        digits = digits.slice(0, digits.len() - 1)
+    (digits, point)
+
+## strconv.FormatFloat(f, fmt, -1, 64) for fmt 'f' and 'e'.
+pub fn format_float(f: f64, fmt: char) -> string:
+    if f.is_nan():
+        return "NaN"
+    if !f.is_finite():
+        return if f > 0.0: "+Inf" else: "-Inf"
+    neg := f.to_bits() >> 63 == 1
+    sign := if neg: "-" else: ""
+    if f == 0.0:
+        return if fmt == 'e': sign + "0e+00" else: sign + "0"
+    let (digits, point) = float_digits(f.abs())
+    n := i32(digits.len())
+    if fmt == 'e':
+        let out = sign + digits.slice(0, 1)
+        if n > 1:
+            out = out + "." + digits.slice(1, digits.len())
+        e := point - 1
+        a := if e < 0: -e else: e
+        return out + "e" + (if e < 0: "-" else: "+") + (if a < 10: "0" else: "") + "$a"
+    if point <= 0:
+        return sign + "0." + "0".repeat(usize(-point)) + digits
+    if point >= n:
+        return sign + digits + "0".repeat(usize(point - n))
+    sign + digits.slice(0, usize(point)) + "." + digits.slice(usize(point), digits.len())
+
+## strconv.ParseFloat(s, 64): `.Err` for invalid syntax; out of range gives an infinity.
+pub fn parse_float(s: string) -> Result[f64, string]:
+    let body = s
+    let neg = false
+    if body.starts_with("+") || body.starts_with("-"):
+        neg = body.starts_with("-")
+        body = body.slice(1, body.len())
+    match body:
+        "Inf" => return .Ok(if neg: -1.0 / 0.0 else: 1.0 / 0.0)
+        "inf" => return .Ok(if neg: -1.0 / 0.0 else: 1.0 / 0.0)
+        "Infinity" => return .Ok(if neg: -1.0 / 0.0 else: 1.0 / 0.0)
+        "NaN" => return .Ok(0.0 / 0.0)
+        "nan" => return .Ok(0.0 / 0.0)
+        _ => pass
+    # normalize forms like ".5" and "5." and "5.e3" that hd's parser may refuse
+    if body.starts_with("."):
+        body = "0" + body
+    body = body.replace(".e", ".0e").replace(".E", ".0E")
+    if body.ends_with("."):
+        body = body + "0"
+    match body.parse::[f64]():
+        .Ok(f) => .Ok(if neg: -f else: f)
+        .Err(_) =>
+            # an exponent too large for f64 overflows to infinity
+            if body.contains("e") || body.contains("E"):
+                let mant = body
+                match body.find("e"):
+                    .Some(i) => mant = body.slice(0, i)
+                    .None =>
+                        match body.find("E"):
+                            .Some(i) => mant = body.slice(0, i)
+                            .None => pass
+                if mant.parse::[f64]().is_ok():
+                    exp := body.slice(mant.len() + 1, body.len())
+                    if exp.starts_with("-"):
+                        return .Ok(if neg: -0.0 else: 0.0)
+                    return .Ok(if neg: -1.0 / 0.0 else: 1.0 / 0.0)
+            .Err("invalid syntax")
+
+## strconv.ParseInt(s, 10, 64).
+pub fn parse_int(s: string) -> i64?:
+    s.parse::[i64]().ok()
+
+fn hex2(b: u32) -> string:
+    hex := "0123456789abcdef"
+    hex.slice(usize((b >> 4) & 15), usize((b >> 4) & 15) + 1) + hex.slice(usize(b & 15), usize(b & 15) + 1)
+
+fn escape_rune(c: char, quote: char) -> string:
+    u := c.to_u32()
+    if c == quote || c == '\\':
+        return "\\" + c.to_string()
+    match c:
+        '\u{7}' => return "\\a"
+        '\u{8}' => return "\\b"
+        '\u{c}' => return "\\f"
+        '\n' => return "\\n"
+        '\r' => return "\\r"
+        '\t' => return "\\t"
+        '\u{b}' => return "\\v"
+        _ => pass
+    if u < 32 || u == 127:
+        return "\\x" + hex2(u)
+    if u >= 0x80 && u < 0xA0:
+        return "\\u00" + hex2(u)
+    c.to_string()
+
+## strconv.Quote (as %q prints a string).
+pub fn quote(s: string) -> string:
+    out := StringBuilder::new()
+    out.push("\"")
+    for c in s.chars():
+        out.push(escape_rune(c, '"'))
+    out.push("\"")
+    out.build()
+
+## strconv.QuoteRune.
+pub fn quote_rune(c: char) -> string:
+    "'" + escape_rune(c, '\'') + "'"
+
+tests:
+    it("formats floats like Go"):
+        assert_equal(format_float(1e21, 'e'), "1e+21")
+        assert_equal(format_float(1.5e-7, 'e'), "1.5e-07")
+        assert_equal(format_float(0.1 + 0.2, 'f'), "0.30000000000000004")
+        assert_equal(format_float(1e20, 'f'), "100000000000000000000")
+        assert_equal(quote("a\u{0}b"), "\"a\\x00b\"")
+        assert_equal(quote_rune('\n'), "'\\n'")

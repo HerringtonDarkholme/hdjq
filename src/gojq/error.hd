@@ -1,0 +1,149 @@
+## Port of gojq/error.go (and the error values gojq gets from Go's library).
+use pkg.goshim.value.Value
+use pkg.gojq.preview.preview
+use pkg.gojq.typeof.type_of
+use pkg.gojq.encoder.json_marshal
+
+pub enum JqError:
+    ExpectedObject(v: Value)
+    ExpectedArray(v: Value)
+    Iterator(v: Value)
+    ArrayIndexNegative(v: i64)
+    ArrayIndexTooLarge(v: Value)
+    RepeatStringTooLarge(s: string, n: f64)
+    ObjectKeyNotString(v: Value)
+    ArrayIndexNotNumber(v: Value)
+    StringIndexNotNumber(v: Value)
+    ExpectedStartEnd(v: Value)
+    LengthMismatch
+    InputNotAllowed
+    FuncNotFound(name: string, argc: i64)
+    Func0Type(name: string, v: Value)
+    Func1Type(name: string, v: Value, w: Value)
+    Func2Type(name: string, v: Value, w: Value, x: Value)
+    Func0Wrap(name: string, v: Value, err: *JqError)
+    Func1Wrap(name: string, v: Value, w: Value, err: *JqError)
+    Func2Wrap(name: string, v: Value, w: Value, x: Value, err: *JqError)
+    ## exitCodeError: raised by error/0,1 (value, exit code)
+    ExitCode(value: Value, code: i64)
+    ## HaltError: raised by halt and halt_error
+    Halt(value: Value, code: i64)
+    FlattenDepth(v: f64)
+    TimeArray
+    TimeEpoch
+    TimeNumber
+    UnaryType(name: string, v: Value)
+    BinopType(name: string, l: Value, r: Value)
+    ZeroDivision(l: Value, r: Value)
+    ZeroModulo(l: Value, r: Value)
+    FormatNotFound(n: string)
+    FormatRow(typ: string, v: Value)
+    TooManyVariableValues
+    ExpectedVariable(n: string)
+    VariableNotFound(n: string)
+    VariableName(n: string)
+    ## breakError: `break $label` (n), with the label's value
+    Break(n: string, v: Value)
+    TryEnd(err: *JqError)
+    InvalidPath(v: Value)
+    InvalidPathIter(v: Value)
+    QueryParse(fname: string, contents: string, err: *JqError)
+    JsonParse(fname: string, contents: string, err: *JqError)
+    ## gojq.ParseError from the lexer and parser
+    Parse(offset: i64, token: string, token_type: i64)
+    ## *json.SyntaxError
+    JsonSyntax(msg: string, offset: i64)
+    ## io.ErrUnexpectedEOF
+    UnexpectedEOF
+    ## any other error created with errors.New or fmt.Errorf
+    Message(text: string)
+
+## Token types the lexer reports in ParseError (see lexer.hd).
+pub fn tok_eof() -> i64: -1
+pub fn tok_invalid() -> i64: 57382
+pub fn tok_invalid_escape() -> i64: 57383
+pub fn tok_unterminated() -> i64: 57384
+
+pub fn type_error_preview(v: Value) -> string:
+    match v:
+        .Null => "null"
+        _ => type_of(v) + " (" + preview(v) + ")"
+
+fn exit_code_message(value: Value) -> string:
+    match value:
+        .Str(s) => "error: " + s
+        _ => "error: " + json_marshal(value)
+
+## The Error() string of each error.
+pub fn error_string(e: JqError) -> string:
+    match e:
+        .ExpectedObject(v) => "expected an object but got: " + type_error_preview(v)
+        .ExpectedArray(v) => "expected an array but got: " + type_error_preview(v)
+        .Iterator(v) => "cannot iterate over: " + type_error_preview(v)
+        .ArrayIndexNegative(v) => "array index should not be negative: " + preview(.Int(v))
+        .ArrayIndexTooLarge(v) => "array index too large: " + preview(v)
+        .RepeatStringTooLarge(s, n) => "repeat string result too large: " + preview(.Str(s)) + " * " + preview(.Float(n))
+        .ObjectKeyNotString(v) => "expected a string for object key but got: " + type_error_preview(v)
+        .ArrayIndexNotNumber(v) => "expected a number for indexing an array but got: " + type_error_preview(v)
+        .StringIndexNotNumber(v) => "expected a number for indexing a string but got: " + type_error_preview(v)
+        .ExpectedStartEnd(v) => "expected \"start\" and \"end\" for slicing but got: " + type_error_preview(v)
+        .LengthMismatch => "length mismatch"
+        .InputNotAllowed => "input(s)/0 is not allowed"
+        .FuncNotFound(name, argc) => "function not defined: $name/$argc"
+        .Func0Type(name, v) => name + " cannot be applied to: " + type_error_preview(v)
+        .Func1Type(name, v, w) => name + "(" + preview(w) + ") cannot be applied to: " + type_error_preview(v)
+        .Func2Type(name, v, w, x) => name + "(" + preview(w) + "; " + preview(x) + ") cannot be applied to: " + type_error_preview(v)
+        .Func0Wrap(name, v, err) => name + " cannot be applied to " + preview(v) + ": " + error_string(*err)
+        .Func1Wrap(name, v, w, err) => name + "(" + preview(w) + ") cannot be applied to " + preview(v) + ": " + error_string(*err)
+        .Func2Wrap(name, v, w, x, err) => name + "(" + preview(w) + "; " + preview(x) + ") cannot be applied to " + preview(v) + ": " + error_string(*err)
+        .ExitCode(value, _) => exit_code_message(value)
+        .Halt(value, _) => "halt " + exit_code_message(value)
+        .FlattenDepth(v) => "flatten depth should not be negative: " + preview(.Float(v))
+        .TimeArray => "expected an array of 8 numbers"
+        .TimeEpoch => "number of seconds is out of range"
+        .TimeNumber => "number is out of range"
+        .UnaryType(name, v) => "cannot " + name + ": " + type_error_preview(v)
+        .BinopType(name, l, r) => "cannot " + name + ": " + type_error_preview(l) + " and " + type_error_preview(r)
+        .ZeroDivision(l, r) => "cannot divide " + type_error_preview(l) + " by: " + type_error_preview(r)
+        .ZeroModulo(l, r) => "cannot modulo " + type_error_preview(l) + " by: " + type_error_preview(r)
+        .FormatNotFound(n) => "format not defined: " + n
+        .FormatRow(typ, v) => "@" + typ + " cannot format an array including: " + type_error_preview(v)
+        .TooManyVariableValues => "too many variable values provided"
+        .ExpectedVariable(n) => "variable defined but not bound: " + n
+        .VariableNotFound(n) => "variable not defined: " + n
+        .VariableName(n) => "invalid variable name: " + n
+        .Break(n, _) => "label not defined: " + n
+        .TryEnd(err) => error_string(*err)
+        .InvalidPath(v) => "invalid path against: " + type_error_preview(v)
+        .InvalidPathIter(v) => "invalid path on iterating against: " + type_error_preview(v)
+        .QueryParse(fname, _, err) => "invalid query: " + fname + ": " + error_string(*err)
+        .JsonParse(fname, _, err) => "invalid json: " + fname + ": " + error_string(*err)
+        .Parse(_, token, tt) =>
+            if tt == tok_eof():
+                "unexpected EOF"
+            else if tt == tok_invalid():
+                "invalid token " + json_marshal(.Str(token))
+            else if tt == tok_invalid_escape():
+                "invalid escape sequence \"" + token + "\" in string literal"
+            else if tt == tok_unterminated():
+                "unterminated string literal"
+            else:
+                "unexpected token " + json_marshal(.Str(token))
+        .JsonSyntax(msg, _) => msg
+        .UnexpectedEOF => "unexpected EOF"
+        .Message(text) => text
+
+## ValueError: the value of an error that error/0,1 or halt_error raised.
+pub fn value_of(e: JqError) -> Value?:
+    match e:
+        .ExitCode(v, _) => .Some(v)
+        .Halt(v, _) => .Some(v)
+        _ => .None
+
+## The ExitCode() of an error, when it has one.
+pub fn exit_code_of(e: JqError) -> i64?:
+    match e:
+        .ExitCode(_, c) => .Some(c)
+        .Halt(_, c) => .Some(c)
+        .Break(_, _) => .Some(3)
+        _ => .None

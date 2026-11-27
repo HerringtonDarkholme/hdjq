@@ -1,0 +1,79 @@
+## Port of gojq/number.go.
+use pkg.goshim.value.Value
+use pkg.goshim.bigint
+use pkg.goshim.bigint.BigInt
+use pkg.goshim.strconv.parse_float
+
+MAX_INT := 9223372036854775807i64
+MIN_INT := -9223372036854775807i64 - 1
+
+## ToInt returns the int value of v, and whether v is a number.
+pub fn to_int(v: Value) -> i64?:
+    match v:
+        .Int(i) => .Some(i)
+        .Float(f) => .Some(float_to_int(f))
+        .Big(b) =>
+            match bigint.to_i64(b):
+                .Some(i) => .Some(i)
+                .None => .Some(if b.neg: MIN_INT else: MAX_INT)
+        .Number(s) => to_int(parse_number(s))
+        _ => .None
+
+## ToFloat64 returns the float64 value of v, and whether v is a number.
+pub fn to_float64(v: Value) -> f64?:
+    match v:
+        .Int(i) => .Some(f64(i))
+        .Float(f) => .Some(f)
+        .Big(b) => .Some(big_to_float(b))
+        .Number(s) => to_float64(parse_number(s))
+        _ => .None
+
+pub fn float_to_int(x: f64) -> i64:
+    if x >= -9223372036854775808.0 && x < 9223372036854775807.0:
+        return i64(x)
+    if x > 0.0:
+        return MAX_INT
+    MIN_INT
+
+pub fn big_to_float(x: BigInt) -> f64:
+    match bigint.to_i64(x):
+        .Some(i) => return f64(i)
+        .None => pass
+    match parse_float(bigint.to_string(x)):
+        .Ok(f) => f
+        .Err(_) => if x.neg: -1.0 / 0.0 else: 1.0 / 0.0
+
+fn contains_any(s: string, chars: string) -> bool:
+    for c in chars.chars():
+        if s.contains(c.to_string()):
+            return true
+    false
+
+## parseNumber normalizes a json.Number to int, float64 or *big.Int.
+pub fn parse_number(v: string) -> Value:
+    match v.parse::[i64]():
+        .Ok(i) => return .Int(i)
+        .Err(_) => pass
+    if contains_any(v, ".eE"):
+        match parse_float(v):
+            .Ok(f) =>
+                if f.is_finite() || !contains_any(v, "0123456789"):
+                    return .Float(f)
+                # Go's ParseFloat reports a range error for overflow; fall through
+            .Err(_) => pass
+    match bigint.parse(v):
+        .Some(b) => return .Big(b)
+        .None => pass
+    if v.starts_with("-"):
+        return .Float(-1.0 / 0.0)
+    .Float(1.0 / 0.0)
+
+## toNumber (func.go) converts number text to a value.
+pub fn to_number(v: string) -> Value:
+    parse_number(v)
+
+## Values of a Value that is any kind of number, normalized (json.Number parsed).
+pub fn norm(v: Value) -> Value:
+    match v:
+        .Number(s) => parse_number(s)
+        _ => v

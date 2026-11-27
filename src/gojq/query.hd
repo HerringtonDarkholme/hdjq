@@ -1,0 +1,422 @@
+## Port of gojq/query.go and the Operator and TermType enums: the abstract
+## syntax tree of a jq query. Nodes are mutable boxes, as gojq's compiler
+## edits them in place.
+use pkg.goshim.value.{Value, obj, arr}
+use pkg.gojq.number.to_number
+use pkg.gojq.operator.func_op_negate
+
+@derive(Eq, Debug)
+pub enum Operator:
+    OpNone
+    OpPipe
+    OpComma
+    OpAdd
+    OpSub
+    OpMul
+    OpDiv
+    OpMod
+    OpEq
+    OpNe
+    OpGt
+    OpLt
+    OpGe
+    OpLe
+    OpAnd
+    OpOr
+    OpAlt
+    OpAssign
+    OpModify
+    OpUpdateAdd
+    OpUpdateSub
+    OpUpdateMul
+    OpUpdateDiv
+    OpUpdateMod
+    OpUpdateAlt
+
+pub fn op_string(op: Operator) -> string:
+    match op:
+        .OpPipe => "|"
+        .OpComma => ","
+        .OpAdd => "+"
+        .OpSub => "-"
+        .OpMul => "*"
+        .OpDiv => "/"
+        .OpMod => "%"
+        .OpEq => "=="
+        .OpNe => "!="
+        .OpGt => ">"
+        .OpLt => "<"
+        .OpGe => ">="
+        .OpLe => "<="
+        .OpAnd => "and"
+        .OpOr => "or"
+        .OpAlt => "//"
+        .OpAssign => "="
+        .OpModify => "|="
+        .OpUpdateAdd => "+="
+        .OpUpdateSub => "-="
+        .OpUpdateMul => "*="
+        .OpUpdateDiv => "/="
+        .OpUpdateMod => "%="
+        .OpUpdateAlt => "//="
+        .OpNone => panic("Operator(0)")
+
+## The internal function an operator compiles to (operator.go getFunc).
+pub fn op_func(op: Operator) -> string:
+    match op:
+        .OpPipe => panic("unreachable")
+        .OpComma => panic("unreachable")
+        .OpAdd => "_add"
+        .OpSub => "_subtract"
+        .OpMul => "_multiply"
+        .OpDiv => "_divide"
+        .OpMod => "_modulo"
+        .OpEq => "_equal"
+        .OpNe => "_notequal"
+        .OpGt => "_greater"
+        .OpLt => "_less"
+        .OpGe => "_greatereq"
+        .OpLe => "_lesseq"
+        .OpAnd => panic("unreachable")
+        .OpOr => panic("unreachable")
+        .OpAlt => "_alternative"
+        .OpAssign => "_assign"
+        .OpModify => "_modify"
+        .OpUpdateAdd => "_add"
+        .OpUpdateSub => "_subtract"
+        .OpUpdateMul => "_multiply"
+        .OpUpdateDiv => "_divide"
+        .OpUpdateMod => "_modulo"
+        .OpUpdateAlt => "_alternative"
+        .OpNone => panic("Operator(0)")
+
+@derive(Eq, Debug)
+pub enum TermType:
+    TermTypeIdentity
+    TermTypeRecurse
+    TermTypeNull
+    TermTypeTrue
+    TermTypeFalse
+    TermTypeIndex
+    TermTypeFunc
+    TermTypeObject
+    TermTypeArray
+    TermTypeNumber
+    TermTypeUnary
+    TermTypeFormat
+    TermTypeString
+    TermTypeIf
+    TermTypeTry
+    TermTypeReduce
+    TermTypeForeach
+    TermTypeLabel
+    TermTypeBreak
+    TermTypeQuery
+
+pub struct Query:
+    pub meta: (*mut ConstObject)? = .None
+    pub imports: List[*mut Import] = []
+    pub func_defs: List[*mut FuncDef] = []
+    pub term: (*mut Term)? = .None
+    pub left: (*mut Query)? = .None
+    pub right: (*mut Query)? = .None
+    pub patterns: List[*mut Pattern] = []
+    pub op: Operator = .OpNone
+
+pub struct Import:
+    pub import_path: string = ""
+    pub import_alias: string = ""
+    pub include_path: string = ""
+    pub meta: (*mut ConstObject)? = .None
+
+pub struct FuncDef:
+    pub name: string
+    pub args: List[string] = []
+    pub body: *mut Query
+
+pub struct Term:
+    pub typ: TermType
+    pub index: (*mut Index)? = .None
+    pub func: (*mut Func)? = .None
+    pub object: (*mut Object)? = .None
+    pub array: (*mut Array)? = .None
+    pub number: string = ""
+    pub unary: (*mut Unary)? = .None
+    pub format: string = ""
+    pub str: (*mut StringT)? = .None
+    pub if_: (*mut If)? = .None
+    pub try_: (*mut Try)? = .None
+    pub reduce: (*mut Reduce)? = .None
+    pub foreach: (*mut Foreach)? = .None
+    pub label: (*mut Label)? = .None
+    pub break_: string = ""
+    pub query: (*mut Query)? = .None
+    pub suffix_list: List[*mut Suffix] = []
+
+pub struct Unary:
+    pub op: Operator
+    pub term: *mut Term
+
+pub struct Pattern:
+    pub name: string = ""
+    pub array: List[*mut Pattern] = []
+    pub object: List[*mut PatternObject] = []
+
+pub struct PatternObject:
+    pub key: string = ""
+    pub key_string: (*mut StringT)? = .None
+    pub key_query: (*mut Query)? = .None
+    pub val: (*mut Pattern)? = .None
+
+pub struct Index:
+    pub name: string = ""
+    pub str: (*mut StringT)? = .None
+    pub start: (*mut Query)? = .None
+    pub end: (*mut Query)? = .None
+    pub is_slice: bool = false
+
+pub struct Func:
+    pub name: string
+    pub args: List[*mut Query] = []
+
+## gojq's String type (a string literal, possibly with interpolations).
+pub struct StringT:
+    pub str: string = ""
+    ## `.None` for a plain string; the parts of an interpolated one
+    pub queries: (List[*mut Query])? = .None
+
+pub struct Object:
+    pub key_vals: List[*mut ObjectKeyVal] = []
+
+pub struct ObjectKeyVal:
+    pub key: string = ""
+    pub key_string: (*mut StringT)? = .None
+    pub key_query: (*mut Query)? = .None
+    pub val: (*mut Query)? = .None
+
+pub struct Array:
+    pub query: (*mut Query)? = .None
+
+pub struct Suffix:
+    pub index: (*mut Index)? = .None
+    pub iter: bool = false
+    pub optional: bool = false
+
+pub struct If:
+    pub cond: *mut Query
+    pub then_: *mut Query
+    pub elif: List[*mut IfElif] = []
+    pub else_: (*mut Query)? = .None
+
+pub struct IfElif:
+    pub cond: *mut Query
+    pub then_: *mut Query
+
+pub struct Try:
+    pub body: *mut Query
+    pub catch: (*mut Query)? = .None
+
+pub struct Reduce:
+    pub query: *mut Query
+    pub patterns: List[*mut Pattern]
+    pub start: *mut Query
+    pub update: *mut Query
+
+pub struct Foreach:
+    pub query: *mut Query
+    pub patterns: List[*mut Pattern]
+    pub start: *mut Query
+    pub update: *mut Query
+    pub extract: (*mut Query)? = .None
+
+pub struct Label:
+    pub ident: string
+    pub body: *mut Query
+
+pub struct ConstTerm:
+    pub object: (*mut ConstObject)? = .None
+    pub array: (*mut ConstArray)? = .None
+    pub number: string = ""
+    pub str: string = ""
+    pub null: bool = false
+    pub true_: bool = false
+    pub false_: bool = false
+
+pub struct ConstObject:
+    pub key_vals: List[*mut ConstObjectKeyVal] = []
+
+pub struct ConstObjectKeyVal:
+    pub key: string = ""
+    pub key_string: string = ""
+    pub val: *mut ConstTerm
+
+pub struct ConstArray:
+    pub elems: List[*mut ConstTerm] = []
+
+pub fn new_query() -> *mut Query:
+    box(Query {})
+
+pub fn term_query(t: *mut Term) -> *mut Query:
+    box(Query { term: .Some(t) })
+
+pub fn new_term(typ: TermType) -> *mut Term:
+    box(Term { typ: typ })
+
+# ---------------------------------------------------------------- helpers
+
+pub fn query_to_index_key(e: *mut Query) -> Value?:
+    match e.term:
+        .Some(t) => term_to_index_key(t)
+        .None => .None
+
+pub fn query_to_indices(e: *mut Query, xs: List[Value]) -> (List[Value])?:
+    match e.term:
+        .Some(t) => term_to_indices(t, xs)
+        .None => .None
+
+pub fn term_to_index_key(e: *mut Term) -> Value?:
+    if !e.suffix_list.is_empty():
+        return .None
+    match e.typ:
+        .TermTypeNumber => .Some(to_number(e.number))
+        .TermTypeUnary =>
+            match e.unary:
+                .Some(u) => unary_to_number(u)
+                .None => .None
+        .TermTypeString =>
+            match e.str:
+                .Some(s) =>
+                    match s.queries:
+                        .None => .Some(.Str(s.str))
+                        .Some(_) => .None
+                .None => .None
+        _ => .None
+
+pub fn term_to_indices(e: *mut Term, xs0: List[Value]) -> (List[Value])?:
+    let xs = xs0
+    match e.typ:
+        .TermTypeIndex =>
+            match e.index:
+                .Some(ix) =>
+                    match index_to_indices(ix, xs):
+                        .Some(ys) => xs = ys
+                        .None => return .None
+                .None => return .None
+        .TermTypeQuery =>
+            match e.query:
+                .Some(q) =>
+                    match query_to_indices(q, xs):
+                        .Some(ys) => xs = ys
+                        .None => return .None
+                .None => return .None
+        _ => return .None
+    for s in e.suffix_list:
+        match suffix_to_indices(s, xs):
+            .Some(ys) => xs = ys
+            .None => return .None
+    .Some(xs)
+
+pub fn term_to_number(e: *mut Term) -> Value?:
+    match e.typ:
+        .TermTypeNumber =>
+            if e.suffix_list.is_empty():
+                return .Some(to_number(e.number))
+            .None
+        _ => .None
+
+pub fn unary_to_number(e: *mut Unary) -> Value?:
+    let .Some(v) = term_to_number(e.term) else:
+        return .None
+    match e.op:
+        .OpSub =>
+            match func_op_negate(v):
+                .Ok(w) => .Some(w)
+                .Err(_) => .None
+        _ => .Some(v)
+
+pub fn index_to_index_key(e: *mut Index) -> Value?:
+    if e.name != "":
+        return .Some(.Str(e.name))
+    match e.str:
+        .Some(s) =>
+            match s.queries:
+                .None => return .Some(.Str(s.str))
+                .Some(_) => return .None
+        .None => pass
+    if !e.is_slice:
+        match e.start:
+            .Some(q) => return query_to_index_key(q)
+            .None => return .None
+    let start = Value.Null
+    let end = Value.Null
+    let ok = true
+    match e.start:
+        .Some(q) =>
+            match query_to_index_key(q):
+                .Some(k) => start = k
+                .None => ok = false
+        .None => pass
+    if ok:
+        match e.end:
+            .Some(q) =>
+                match query_to_index_key(q):
+                    .Some(k) => end = k
+                    .None => ok = false
+            .None => pass
+    if ok:
+        let mut m: Map[string, Value] = {}
+        m["start"] = start
+        m["end"] = end
+        return .Some(obj(m))
+    .None
+
+pub fn index_to_indices(e: *mut Index, xs: List[Value]) -> (List[Value])?:
+    match index_to_index_key(e):
+        .Some(k) =>
+            let mut ys = xs
+            ys.push(k)
+            .Some(ys)
+        .None => .None
+
+pub fn suffix_to_term(e: *mut Suffix) -> (*mut Term)?:
+    match e.index:
+        .Some(ix) => .Some(box(Term { typ: .TermTypeIndex, index: .Some(ix) }))
+        .None =>
+            if e.iter:
+                return .Some(box(Term { typ: .TermTypeIdentity, suffix_list: [box(Suffix { iter: true })] }))
+            .None
+
+pub fn suffix_to_indices(e: *mut Suffix, xs: List[Value]) -> (List[Value])?:
+    match e.index:
+        .Some(ix) => index_to_indices(ix, xs)
+        .None => .None
+
+pub fn const_term_to_value(e: *mut ConstTerm) -> Value:
+    match e.object:
+        .Some(o) => return obj(const_object_to_value(o))
+        .None => pass
+    match e.array:
+        .Some(a) => return arr([for t in a.elems => const_term_to_value(t)])
+        .None => pass
+    if e.number != "":
+        return to_number(e.number)
+    if e.null:
+        return .Null
+    if e.true_:
+        return .Bool(true)
+    if e.false_:
+        return .Bool(false)
+    .Str(e.str)
+
+pub fn const_term_to_string(e: *mut ConstTerm) -> string?:
+    if e.object.is_some() || e.array.is_some() || e.number != "" || e.null || e.true_ || e.false_:
+        return .None
+    .Some(e.str)
+
+## ConstObject.ToValue
+pub fn const_object_to_value(e: *mut ConstObject) -> Map[string, Value]:
+    let mut v: Map[string, Value] = {}
+    for kv in e.key_vals:
+        k := if kv.key != "": kv.key else: kv.key_string
+        v[k] = const_term_to_value(kv.val)
+    v

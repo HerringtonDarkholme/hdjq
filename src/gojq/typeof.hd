@@ -1,0 +1,16 @@
+## Port of gojq/type.go.
+use pkg.goshim.value.Value
+
+## TypeOf returns the jq-flavored type name of v.
+pub fn type_of(v: Value) -> string:
+    match v:
+        .Null => "null"
+        .Bool(_) => "boolean"
+        .Int(_) => "number"
+        .Float(_) => "number"
+        .Big(_) => "number"
+        .Number(_) => "number"
+        .Str(_) => "string"
+        .Arr(_) => "array"
+        .Obj(_) => "object"
+        .Hole => panic("invalid type: struct {}")

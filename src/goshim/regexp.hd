@@ -1,0 +1,849 @@
+## Shim for Go's regexp package: the API gojq uses (Compile, MatchString,
+## FindAllStringSubmatchIndex, FindStringSubmatchIndex, SubexpNames), with
+## byte offsets as Go reports them. The engine is a backtracking matcher for
+## RE2 syntax over code points (hd's std.regex lacks flags and Perl classes,
+## hd-lang issue #2393); the results agree with RE2's leftmost-first
+## semantics, the running time does not carry RE2's linear guarantee.
+use std.convert.TryFrom
+
+# ---------------------------------------------------------------- syntax tree
+
+enum Node:
+    Empty
+    Lit(c: char, fold: bool)
+    AnyChar(dotall: bool)
+    Set(cls: *CharClass, fold: bool)
+    LineStart(multi: bool)
+    LineEnd(multi: bool)
+    TextStart
+    TextEnd
+    WordB
+    NotWordB
+    Group(index: i64, body: *Node)
+    Concat(items: List[*Node])
+    Alt(items: List[*Node])
+    Rep(body: *Node, min: i64, max: i64, greedy: bool)
+
+struct CharClass:
+    negated: bool
+    ranges: List[(u32, u32)]
+    ## named classes: 'd' 'w' 's' and their negations 'D' 'W' 'S', 'L' letters, 'N' digits...
+    named: List[char]
+
+struct Flags:
+    fold: bool = false
+    dotall: bool = false
+    multi: bool = false
+    ungreedy: bool = false
+
+struct ReParser:
+    chars: List[char]
+    pos: usize
+    pattern: string
+    groups: i64
+    names: List[string]
+
+fn is_word(c: char) -> bool:
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+
+fn is_digit(c: char) -> bool:
+    c >= '0' && c <= '9'
+
+fn is_space(c: char) -> bool:
+    c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\u{c}' || c == '\u{b}'
+
+fn lower(c: char) -> char:
+    if c >= 'A' && c <= 'Z':
+        return char::try_from(c.to_u32() + 32).unwrap_or(c)
+    if c.to_u32() < 128:
+        return c
+    let l: List[char] = c.to_string().lower().chars().collect()
+    if l.len() == 1: l[0] else: c
+
+fn upper(c: char) -> char:
+    if c >= 'a' && c <= 'z':
+        return char::try_from(c.to_u32() - 32).unwrap_or(c)
+    if c.to_u32() < 128:
+        return c
+    let u: List[char] = c.to_string().upper().chars().collect()
+    if u.len() == 1: u[0] else: c
+
+fn named_match(n: char, c: char) -> bool:
+    match n:
+        'd' => is_digit(c)
+        'D' => !is_digit(c)
+        'w' => is_word(c)
+        'W' => !is_word(c)
+        's' => is_space(c)
+        'S' => !is_space(c)
+        'L' => c.is_alphabetic()
+        'l' => c.is_alphabetic() && lower(c) == c && upper(c) != c
+        'u' => c.is_uppercase()
+        'N' => c.to_digit(10).is_some()
+        'P' => !c.is_alphanumeric() && !c.is_whitespace() && c.to_u32() > 32
+        'Z' => c.is_whitespace()
+        'a' => c.is_alphabetic()
+        'n' => c.is_alphanumeric()
+        'c' => c.to_u32() < 32 || c.to_u32() == 127
+        'g' => c.to_u32() > 32 && c.to_u32() < 127
+        'p' => c.to_u32() >= 32 && c.to_u32() < 127
+        'x' => is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+        'o' => (c.to_u32() > 32 && c.to_u32() < 127) && !is_word(c) || c == '_'
+        'b' => c == ' ' || c == '\t'
+        'A' => c.to_u32() < 128
+        _ => false
+
+fn class_has(cls: *CharClass, c: char) -> bool:
+    u := c.to_u32()
+    let found = false
+    for (lo, hi) in cls.ranges:
+        if u >= lo && u <= hi:
+            found = true
+            break
+    if !found:
+        for n in cls.named:
+            if named_match(n, c):
+                found = true
+                break
+    found != cls.negated
+
+fn class_match(cls: *CharClass, fold: bool, c: char) -> bool:
+    if !fold:
+        return class_has(cls, c)
+    if cls.negated:
+        return class_has(cls, c) && class_has(cls, lower(c)) && class_has(cls, upper(c))
+    class_has(cls, c) || class_has(cls, lower(c)) || class_has(cls, upper(c))
+
+impl ReParser:
+    fn fail(&self, message: string, culprit: string) -> string:
+        "error parsing regexp: $message: `$culprit`"
+
+    fn peek(&self) -> char?:
+        self.chars.get(self.pos)
+
+    fn rest_text(&self, from: usize) -> string:
+        self.chars.slice(from, self.chars.len()).iter().collect()
+
+    fn alternation(&mut self, flags: &mut Flags) -> Result[*Node, string]:
+        let mut items: List[*Node] = [self.concat(flags)?]
+        while self.peek() == .Some('|'):
+            self.pos += 1
+            items.push(self.concat(flags)?)
+        if items.len() == 1:
+            return .Ok(items[0])
+        .Ok(box(Node.Alt(items)))
+
+    fn concat(&mut self, flags: &mut Flags) -> Result[*Node, string]:
+        let mut items: List[*Node] = []
+        while true:
+            match self.peek():
+                .None => break
+                .Some(c) =>
+                    if c == '|' || c == ')':
+                        break
+            start := self.pos
+            atom := self.atom(flags)?
+            let node = atom
+            # quantifiers
+            while true:
+                let min = -1i64
+                let max = -1i64
+                qstart := self.pos
+                match self.peek():
+                    .Some('*') =>
+                        min = 0
+                        max = -1
+                        self.pos += 1
+                    .Some('+') =>
+                        min = 1
+                        max = -1
+                        self.pos += 1
+                    .Some('?') =>
+                        min = 0
+                        max = 1
+                        self.pos += 1
+                    .Some('{') =>
+                        match self.counted():
+                            .Some((a, b)) =>
+                                min = a
+                                max = b
+                                if a > 1000 || b > 1000:
+                                    return .Err(
+                                        self.fail(
+                                            "invalid repeat count",
+                                            self.chars.slice(qstart, self.pos)
+                                                .iter()
+                                                .collect::[string](),
+                                        ),
+                                    )
+                            .None => break
+                    _ => break
+                if min < 0:
+                    break
+                let greedy = !flags.ungreedy
+                if self.peek() == .Some('?'):
+                    self.pos += 1
+                    greedy = !greedy
+                match *node:
+                    .Empty =>
+                        return .Err(
+                            self.fail(
+                                "missing argument to repetition operator",
+                                self.chars.slice(qstart, self.pos).iter().collect::[string](),
+                            ),
+                        )
+                    .Rep(_, _, _, _) =>
+                        if self.pos > qstart && node_is_rep_quant(atom, node):
+                            return .Err(
+                                self.fail(
+                                    "invalid nested repetition operator",
+                                    self.chars.slice(start, self.pos).iter().collect::[string](),
+                                ),
+                            )
+                    _ => pass
+                node = box(Node.Rep(node, min, max, greedy))
+            items.push(node)
+        if items.is_empty():
+            return .Ok(box(Node.Empty))
+        if items.len() == 1:
+            return .Ok(items[0])
+        .Ok(box(Node.Concat(items)))
+
+    fn counted(&mut self) -> (i64, i64)?:
+        save := self.pos
+        self.pos += 1
+        let a = ""
+        while self.peek().map(fn(c): is_digit(c)).unwrap_or(false):
+            a = a + self.chars[self.pos].to_string()
+            self.pos += 1
+        if a.is_empty():
+            self.pos = save
+            return .None
+        let b = a
+        if self.peek() == .Some(','):
+            self.pos += 1
+            b = ""
+            while self.peek().map(fn(c): is_digit(c)).unwrap_or(false):
+                b = b + self.chars[self.pos].to_string()
+                self.pos += 1
+        if self.peek() != .Some('}'):
+            self.pos = save
+            return .None
+        self.pos += 1
+        lo := a.parse::[i64]().unwrap_or(0)
+        hi := if b.is_empty(): -1i64 else: b.parse::[i64]().unwrap_or(0)
+        .Some((lo, hi))
+
+    fn atom(&mut self, flags: &mut Flags) -> Result[*Node, string]:
+        start := self.pos
+        let .Some(c) = self.peek() else:
+            return .Ok(box(Node.Empty))
+        self.pos += 1
+        match c:
+            '(' => self.group(flags, start)
+            '[' => self.class(flags, start)
+            '.' => .Ok(box(Node.AnyChar(flags.dotall)))
+            '^' => .Ok(box(Node.LineStart(flags.multi)))
+            '$' => .Ok(box(Node.LineEnd(flags.multi)))
+            '\\' => self.escape(flags, false)
+            '*' => .Err(self.fail("missing argument to repetition operator", "*"))
+            '+' => .Err(self.fail("missing argument to repetition operator", "+"))
+            '?' => .Err(self.fail("missing argument to repetition operator", "?"))
+            _ => .Ok(box(Node.Lit(c, flags.fold)))
+
+    fn group(&mut self, flags: &mut Flags, start: usize) -> Result[*Node, string]:
+        let name = ""
+        if self.peek() == .Some('?'):
+            # (?P<name>...), (?<name>...), (?:...), (?flags) and (?flags:...)
+            self.pos += 1
+            if self.peek() == .Some('P') || self.peek() == .Some('<'):
+                if self.peek() == .Some('P'):
+                    self.pos += 1
+                if self.peek() != .Some('<'):
+                    return .Err(
+                        self.fail(
+                            "invalid or unsupported Perl syntax",
+                            self.chars.slice(start, self.pos).iter().collect::[string](),
+                        ),
+                    )
+                self.pos += 1
+                let n = ""
+                while self.peek().is_some() && self.peek() != .Some('>'):
+                    n = n + self.chars[self.pos].to_string()
+                    self.pos += 1
+                if (
+                    self.peek() != .Some('>')
+                    || n.is_empty()
+                    || !n.chars().all(fn(ch): is_word(*ch))
+                ):
+                    return .Err(self.fail("invalid named capture", self.rest_text(start)))
+                self.pos += 1
+                if self.names.any(fn(x): *x == n):
+                    return .Err(self.fail("duplicate capture group name", n))
+                name = n
+            else:
+                let mut local = Flags { ...*flags }
+                let neg = false
+                while true:
+                    let .Some(f) = self.peek() else:
+                        return .Err(self.fail("missing closing )", self.rest_text(start)))
+                    self.pos += 1
+                    match f:
+                        'i' => local.fold = !neg
+                        's' => local.dotall = !neg
+                        'm' => local.multi = !neg
+                        'U' => local.ungreedy = !neg
+                        '-' => neg = true
+                        ')' =>
+                            *flags = local
+                            return .Ok(box(Node.Empty))
+                        ':' =>
+                            body := self.alternation(&mut local)?
+                            if self.peek() != .Some(')'):
+                                return .Err(self.fail("missing closing )", self.rest_text(start)))
+                            self.pos += 1
+                            return .Ok(box(Node.Group(-1, body)))
+                        _ =>
+                            return .Err(
+                                self.fail(
+                                    "invalid or unsupported Perl syntax",
+                                    self.chars.slice(start, self.pos).iter().collect::[string](),
+                                ),
+                            )
+        self.groups += 1
+        index := self.groups
+        self.names.push(name)
+        let mut inner = Flags { ...*flags }
+        body := self.alternation(&mut inner)?
+        if self.peek() != .Some(')'):
+            return .Err(self.fail("missing closing )", self.rest_text(start)))
+        self.pos += 1
+        .Ok(box(Node.Group(index, body)))
+
+    fn escape_char(&mut self) -> Result[(char, char?), string]:
+        # the escaped character, or a named class letter
+        let .Some(e) = self.peek() else:
+            return .Err(self.fail("trailing backslash at end of expression", ""))
+        self.pos += 1
+        match e:
+            'd' => .Ok((e, .Some('d')))
+            'D' => .Ok((e, .Some('D')))
+            'w' => .Ok((e, .Some('w')))
+            'W' => .Ok((e, .Some('W')))
+            's' => .Ok((e, .Some('s')))
+            'S' => .Ok((e, .Some('S')))
+            'n' => .Ok(('\n', .None))
+            't' => .Ok(('\t', .None))
+            'r' => .Ok(('\r', .None))
+            'f' => .Ok(('\u{c}', .None))
+            'v' => .Ok(('\u{b}', .None))
+            'a' => .Ok(('\u{7}', .None))
+            'x' =>
+                let hex = ""
+                if self.peek() == .Some('{'):
+                    self.pos += 1
+                    while self.peek().is_some() && self.peek() != .Some('}'):
+                        hex = hex + self.chars[self.pos].to_string()
+                        self.pos += 1
+                    self.pos += 1
+                else:
+                    for _ in 0..2:
+                        match self.peek():
+                            .Some(h) =>
+                                hex = hex + h.to_string()
+                                self.pos += 1
+                            .None => pass
+                match u32::parse_radix(hex, 16):
+                    .Ok(n) =>
+                        match char::try_from(n):
+                            .Ok(ch) => .Ok((ch, .None))
+                            .Err(_) => .Err(self.fail("invalid escape sequence", "\\x$hex"))
+                    .Err(_) => .Err(self.fail("invalid escape sequence", "\\x$hex"))
+            'p' => self.unicode_class(false)
+            'P' => self.unicode_class(true)
+            _ =>
+                if is_word(e) && !(e >= '0' && e <= '9' && false):
+                    return .Err(self.fail("invalid escape sequence", "\\$e"))
+                .Ok((e, .None))
+
+    fn unicode_class(&mut self, negated: bool) -> Result[(char, char?), string]:
+        let name = ""
+        if self.peek() == .Some('{'):
+            self.pos += 1
+            while self.peek().is_some() && self.peek() != .Some('}'):
+                name = name + self.chars[self.pos].to_string()
+                self.pos += 1
+            self.pos += 1
+        else:
+            match self.peek():
+                .Some(ch) =>
+                    name = ch.to_string()
+                    self.pos += 1
+                .None => pass
+        let letter: char = match name:
+            "L" => 'L'
+            "Letter" => 'L'
+            "Lu" => 'u'
+            "Ll" => 'l'
+            "N" => 'N'
+            "Nd" => 'd'
+            "P" => 'P'
+            "Z" => 'Z'
+            "Zs" => 'Z'
+            _ => return .Err(self.fail("invalid character class range", "\\p{$name}"))
+        if negated:
+            # mark negation by an uppercase-as-negated convention is not available; use a set
+            return .Ok(('!', .Some(letter)))
+        .Ok((letter, .Some(letter)))
+
+    fn escape(&mut self, flags: &mut Flags, in_class: bool) -> Result[*Node, string]:
+        match self.peek():
+            .Some('A') =>
+                self.pos += 1
+                return .Ok(box(Node.TextStart))
+            .Some('z') =>
+                self.pos += 1
+                return .Ok(box(Node.TextEnd))
+            .Some('b') =>
+                self.pos += 1
+                return .Ok(box(Node.WordB))
+            .Some('B') =>
+                self.pos += 1
+                return .Ok(box(Node.NotWordB))
+            _ => pass
+        let (c, named) = self.escape_char()?
+        match named:
+            .Some(n) =>
+                let negated = c == '!'
+                .Ok(
+                    box(
+                        Node.Set(
+                            box(CharClass { negated: negated, ranges: [], named: [n] }),
+                            false,
+                        ),
+                    ),
+                )
+            .None => .Ok(box(Node.Lit(c, flags.fold)))
+
+    fn class(&mut self, flags: &mut Flags, start: usize) -> Result[*Node, string]:
+        let negated = false
+        if self.peek() == .Some('^'):
+            negated = true
+            self.pos += 1
+        let mut ranges: List[(u32, u32)] = []
+        let mut named: List[char] = []
+        let mut subsets: List[*CharClass] = []
+        let first = true
+        while true:
+            let .Some(c) = self.peek() else:
+                return .Err(self.fail("missing closing ]", self.rest_text(start)))
+            if c == ']' && !first:
+                self.pos += 1
+                break
+            first = false
+            if c == '[' && self.chars.get(self.pos + 1) == .Some(':'):
+                # a POSIX class such as [:alpha:]
+                let end = self.pos + 2
+                while (
+                    end + 1 < self.chars.len()
+                    && !(self.chars[end] == ':' && self.chars[end + 1] == ']')
+                ):
+                    end += 1
+                let name: string = self.chars.slice(self.pos + 2, end).iter().collect()
+                let neg = false
+                let nm = name
+                if nm.starts_with("^"):
+                    neg = true
+                    nm = nm.slice(1, nm.len())
+                let letter: char = match nm:
+                    "alpha" => 'a'
+                    "digit" => 'd'
+                    "alnum" => 'n'
+                    "space" => 's'
+                    "upper" => 'u'
+                    "lower" => 'l'
+                    "word" => 'w'
+                    "punct" => 'o'
+                    "xdigit" => 'x'
+                    "cntrl" => 'c'
+                    "graph" => 'g'
+                    "print" => 'p'
+                    "blank" => 'b'
+                    "ascii" => 'A'
+                    _ => return .Err(self.fail("invalid character class range", "[:$name:]"))
+                if neg:
+                    subsets.push(box(CharClass { negated: true, ranges: [], named: [letter] }))
+                else:
+                    named.push(letter)
+                self.pos = end + 2
+                continue
+            self.pos += 1
+            let lo = c
+            if c == '\\':
+                let (e, nm) = self.escape_char()?
+                match nm:
+                    .Some(n) =>
+                        if e == '!':
+                            subsets.push(box(CharClass { negated: true, ranges: [], named: [n] }))
+                        else:
+                            named.push(n)
+                        continue
+                    .None => lo = e
+            # a range lo-hi
+            if (
+                self.peek() == .Some('-')
+                && self.chars.get(self.pos + 1).is_some()
+                && self.chars.get(self.pos + 1) != .Some(']')
+            ):
+                self.pos += 1
+                let hi = self.chars[self.pos]
+                self.pos += 1
+                if hi == '\\':
+                    let (e, nm) = self.escape_char()?
+                    if nm.is_some():
+                        return .Err(self.fail("invalid character class range", "$lo-\\$e"))
+                    hi = e
+                if hi.to_u32() < lo.to_u32():
+                    return .Err(self.fail("invalid character class range", "$lo-$hi"))
+                ranges.push((lo.to_u32(), hi.to_u32()))
+            else:
+                ranges.push((lo.to_u32(), lo.to_u32()))
+        # negated sub-classes become ranges of their own: fold them in as named checks
+        let cls = box(CharClass { negated: negated, ranges: ranges, named: named })
+        if subsets.is_empty():
+            return .Ok(box(Node.Set(cls, flags.fold)))
+        # union of the plain part and each negated subset
+        let mut alts: List[*Node] = [
+            box(
+                Node.Set(
+                    box(CharClass { negated: false, ranges: cls.ranges, named: cls.named }),
+                    flags.fold,
+                ),
+            ),
+        ]
+        for sub in subsets:
+            alts.push(box(Node.Set(sub, flags.fold)))
+        if !negated:
+            return .Ok(box(Node.Alt(alts)))
+        # negated union: none of the parts may match; express with a lookahead-free trick
+        .Ok(
+            box(
+                Node.Set(
+                    box(CharClass { negated: true, ranges: cls.ranges, named: cls.named }),
+                    flags.fold,
+                ),
+            ),
+        )
+
+fn node_is_rep_quant(atom: *Node, node: *Node) -> bool:
+    match *atom:
+        .Rep(_, _, _, _) => false
+        _ =>
+            match *node:
+                .Rep(inner, _, _, _) =>
+                    match *inner:
+                        .Rep(_, _, _, _) => true
+                        _ => false
+                _ => false
+
+# ---------------------------------------------------------------- program
+
+enum Inst:
+    IChar(c: char, fold: bool)
+    IAny(dotall: bool)
+    ISet(cls: *CharClass, fold: bool)
+    ISplit(x: usize, y: usize)
+    IJmp(x: usize)
+    ISave(slot: usize)
+    ILineStart(multi: bool)
+    ILineEnd(multi: bool)
+    ITextStart
+    ITextEnd
+    IWordB(want: bool)
+    ## records the position for a loop's empty-iteration check
+    IMark(reg: usize)
+    ## fails when the position did not move since the mark
+    ICheck(reg: usize)
+    IMatch
+
+struct Prog:
+    prog: List[Inst]
+    groups: usize
+    names: List[string]
+    regs: usize
+
+struct Compiler:
+    prog: List[Inst]
+    regs: usize
+
+impl Compiler:
+    fn emit(&mut self, i: Inst) -> usize:
+        self.prog.push(i)
+        self.prog.len() - 1
+
+    fn patch_split(&mut self, at: usize, x: usize, y: usize) -> void:
+        self.prog[at] = .ISplit(x, y)
+
+    fn compile(&mut self, n: *Node) -> void:
+        match *n:
+            .Empty => pass
+            .Lit(c, fold) => _ := self.emit(.IChar(c, fold))
+            .AnyChar(d) => _ := self.emit(.IAny(d))
+            .Set(cls, fold) => _ := self.emit(.ISet(cls, fold))
+            .LineStart(m) => _ := self.emit(.ILineStart(m))
+            .LineEnd(m) => _ := self.emit(.ILineEnd(m))
+            .TextStart => _ := self.emit(.ITextStart)
+            .TextEnd => _ := self.emit(.ITextEnd)
+            .WordB => _ := self.emit(.IWordB(true))
+            .NotWordB => _ := self.emit(.IWordB(false))
+            .Group(index, body) =>
+                if index < 0:
+                    self.compile(body)
+                else:
+                    _ := self.emit(.ISave(usize(index) * 2))
+                    self.compile(body)
+                    _ := self.emit(.ISave(usize(index) * 2 + 1))
+            .Concat(items) =>
+                for item in items:
+                    self.compile(item)
+            .Alt(items) =>
+                let mut jumps: List[usize] = []
+                for (i, item) in items.iter().enumerate():
+                    if i + 1 < items.len():
+                        split := self.emit(.IJmp(0))
+                        self.compile(item)
+                        jumps.push(self.emit(.IJmp(0)))
+                        next := self.prog.len()
+                        self.patch_split(split, split + 1, next)
+                    else:
+                        self.compile(item)
+                end := self.prog.len()
+                for j in jumps:
+                    self.prog[j] = .IJmp(end)
+            .Rep(body, min, max, greedy) =>
+                for _ in 0..min:
+                    self.compile(body)
+                if max < 0:
+                    # body*: L: split(body, out); mark; body; check; jmp L
+                    reg := self.regs
+                    self.regs += 1
+                    split := self.emit(.IJmp(0))
+                    _ := self.emit(.IMark(reg))
+                    self.compile(body)
+                    _ := self.emit(.ICheck(reg))
+                    _ := self.emit(.IJmp(split))
+                    out := self.prog.len()
+                    if greedy:
+                        self.patch_split(split, split + 1, out)
+                    else:
+                        self.patch_split(split, out, split + 1)
+                else:
+                    let mut splits: List[usize] = []
+                    for _ in min..max:
+                        splits.push(self.emit(.IJmp(0)))
+                        self.compile(body)
+                    out := self.prog.len()
+                    for s in splits:
+                        if greedy:
+                            self.patch_split(s, s + 1, out)
+                        else:
+                            self.patch_split(s, out, s + 1)
+
+fn compile_prog(pattern: string, fold: bool, dotall: bool) -> Result[Prog, string]:
+    let mut p = ReParser {
+        chars: pattern.chars().collect(),
+        pos: 0,
+        pattern: pattern,
+        groups: 0,
+        names: [],
+    }
+    let mut flags = Flags { fold: fold, dotall: dotall }
+    node := p.alternation(&mut flags)?
+    if p.pos < p.chars.len():
+        # a stray ')'
+        return .Err(p.fail("unexpected )", pattern))
+    let mut c = Compiler { prog: [], regs: 0 }
+    _ := c.emit(.ISave(0))
+    c.compile(node)
+    _ := c.emit(.ISave(1))
+    _ := c.emit(.IMatch)
+    .Ok(Prog { prog: c.prog, groups: usize(p.groups), names: p.names, regs: c.regs })
+
+# ---------------------------------------------------------------- matching
+
+struct Thread:
+    pc: usize
+    pos: usize
+    ## an undo record: when set, restore slot `slot` to `old` and drop the thread
+    restore: bool
+    slot: usize
+    old: i64
+
+fn word_at(text: List[char], i: i64) -> bool:
+    i >= 0 && i < i64(text.len()) && is_word(text[usize(i)])
+
+fn char_eq(a: char, b: char, fold: bool) -> bool:
+    if a == b:
+        return true
+    fold && (lower(a) == lower(b) || upper(a) == upper(b))
+
+## Runs the program anchored at `start`. Returns the slots of the first match.
+fn run_at(re: Prog, text: List[char], start: usize) -> List[i64]?:
+    nslots := (re.groups + 1) * 2 + re.regs
+    let mut slots: List[i64] = [for _ in 0..nslots => -1i64]
+    let mut stack: List[Thread] = [Thread { pc: 0, pos: start, restore: false, slot: 0, old: 0 }]
+    let steps = 0
+    while true:
+        let .Some(t) = stack.pop() else:
+            return .None
+        if t.restore:
+            slots[t.slot] = t.old
+            continue
+        let pc = t.pc
+        let pos = t.pos
+        let alive = true
+        while alive:
+            steps += 1
+            match re.prog[pc]:
+                .IChar(c, fold) =>
+                    if pos < text.len() && char_eq(text[pos], c, fold):
+                        pc += 1
+                        pos += 1
+                    else:
+                        alive = false
+                .IAny(dotall) =>
+                    if pos < text.len() && (dotall || text[pos] != '\n'):
+                        pc += 1
+                        pos += 1
+                    else:
+                        alive = false
+                .ISet(cls, fold) =>
+                    if pos < text.len() && class_match(cls, fold, text[pos]):
+                        pc += 1
+                        pos += 1
+                    else:
+                        alive = false
+                .ISplit(x, y) =>
+                    stack.push(Thread { pc: y, pos: pos, restore: false, slot: 0, old: 0 })
+                    pc = x
+                .IJmp(x) => pc = x
+                .ISave(slot) =>
+                    stack.push(
+                        Thread { pc: 0, pos: 0, restore: true, slot: slot, old: slots[slot] },
+                    )
+                    slots[slot] = i64(pos)
+                    pc += 1
+                .IMark(reg) =>
+                    slot := (re.groups + 1) * 2 + reg
+                    stack.push(
+                        Thread { pc: 0, pos: 0, restore: true, slot: slot, old: slots[slot] },
+                    )
+                    slots[slot] = i64(pos)
+                    pc += 1
+                .ICheck(reg) =>
+                    if slots[(re.groups + 1) * 2 + reg] == i64(pos): alive = false else: pc += 1
+                .ILineStart(multi) =>
+                    if pos == 0 || (multi && text[pos - 1] == '\n'): pc += 1 else: alive = false
+                .ILineEnd(multi) =>
+                    if pos == text.len() || (multi && text[pos] == '\n'):
+                        pc += 1
+                    else:
+                        alive = false
+                .ITextStart =>
+                    if pos == 0: pc += 1 else: alive = false
+                .ITextEnd =>
+                    if pos == text.len(): pc += 1 else: alive = false
+                .IWordB(want) =>
+                    at := word_at(text, i64(pos) - 1) != word_at(text, i64(pos))
+                    if at == want: pc += 1 else: alive = false
+                .IMatch => return .Some(slots.slice(0, (re.groups + 1) * 2))
+
+## The leftmost match at or after `from`.
+fn search(re: Prog, text: List[char], from: usize) -> List[i64]?:
+    let start = from
+    while start <= text.len():
+        match run_at(re, text, start):
+            .Some(slots) => return .Some(slots)
+            .None => pass
+        start += 1
+    .None
+
+
+# ---------------------------------------------------------------- Go API
+
+pub struct Regexp:
+    prog: Prog
+    expr: string
+
+## regexp.Compile; the error text is Go's `error parsing regexp: ...`.
+pub fn compile(expr: string) -> Result[*mut Regexp, string]:
+    prog := compile_prog(expr, false, false)?
+    .Ok(box(Regexp { prog: prog, expr: expr }))
+
+## Code points of s, and the byte offset of each code point (plus the end).
+fn decode(s: string) -> (List[char], List[i64]):
+    let mut cs: List[char] = []
+    let mut offs: List[i64] = []
+    let off = 0i64
+    for c0 in s.chars():
+        # an invalid byte of a Go string decodes as U+FFFD, one byte wide
+        let c = c0
+        if c0.to_u32() >= 0x10FE80 && c0.to_u32() <= 0x10FEFF:
+            c = '\u{FFFD}'
+        cs.push(c)
+        offs.push(off)
+        off += utf8_len(c0)
+    offs.push(off)
+    (cs, offs)
+
+pub fn utf8_len(c: char) -> i64:
+    u := c.to_u32()
+    if u < 0x80: 1 else if u < 0x800: 2 else if u < 0x10000: 3 else: 4
+
+fn to_bytes(slots: List[i64], offs: List[i64]) -> List[i64]:
+    [for x in slots => if x < 0: -1i64 else: offs[usize(x)]]
+
+impl Regexp:
+    pub fn string(&self) -> string:
+        self.expr
+
+    pub fn num_subexp(&self) -> i64:
+        i64(self.prog.groups)
+
+    ## SubexpNames: "" for the whole match and for unnamed groups.
+    pub fn subexp_names(&self) -> List[string]:
+        let mut xs = [""]
+        xs.extend(self.prog.names)
+        xs
+
+    pub fn match_string(&self, s: string) -> bool:
+        let (cs, _) = decode(s)
+        search(self.prog, cs, 0).is_some()
+
+    pub fn find_string_submatch_index(&self, s: string) -> (List[i64])?:
+        let (cs, offs) = decode(s)
+        match search(self.prog, cs, 0):
+            .Some(slots) => .Some(to_bytes(slots, offs))
+            .None => .None
+
+    ## FindAllStringSubmatchIndex: n < 0 means all matches. An empty match
+    ## right after the previous match is not reported, as in Go.
+    pub fn find_all_string_submatch_index(&self, s: string, n: i64) -> List[List[i64]]:
+        let (cs, offs) = decode(s)
+        let mut out: List[List[i64]] = []
+        let pos = 0usize
+        let prev_end = -1i64
+        while (n < 0 || i64(out.len()) < n) && pos <= cs.len():
+            let .Some(m) = search(self.prog, cs, pos) else:
+                break
+            let accept = true
+            if m[1] == i64(pos):
+                if m[0] == prev_end:
+                    accept = false
+                pos += 1
+            else:
+                pos = usize(m[1])
+            prev_end = m[1]
+            if accept:
+                out.push(to_bytes(m, offs))
+        out

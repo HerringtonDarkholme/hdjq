@@ -1,0 +1,97 @@
+## Port of gojq/compare.go.
+use pkg.goshim.value.Value
+use pkg.goshim.bigint
+use pkg.goshim.bigint.BigInt
+use pkg.gojq.number.{parse_number, big_to_float}
+use pkg.gojq.operator.{binop_type_switch, Binop}
+use pkg.gojq.encoder.sorted_keys
+
+fn cmp_i(a: i64, b: i64) -> i32:
+    if a < b: -1 else if a > b: 1 else: 0
+
+## Compare l and r, and returns jq-flavored comparison value.
+pub fn compare(l0: Value, r0: Value) -> i32:
+    let l = l0
+    let r = r0
+    match l:
+        .Number(s) => l = parse_number(s)
+        _ => pass
+    match r:
+        .Number(s) => r = parse_number(s)
+        _ => pass
+    match (l, r):
+        (.Int(a), .Float(b)) => return compare_int_float(a, b)
+        (.Float(a), .Int(b)) => return -compare_int_float(b, a)
+        (.Float(a), .Big(b)) => return -compare_big_int_float(b, a)
+        (.Big(a), .Float(b)) => return compare_big_int_float(a, b)
+        _ => pass
+    match binop_type_switch(l, r):
+        .Ints(a, b) => cmp_i(a, b)
+        .Floats(a, b) => compare_floats(a, b)
+        .BigInts(a, b) => bigint.compare(a, b)
+        .Strings(a, b) => if a < b: -1 else if a > b: 1 else: 0
+        .Arrays(la, ra) =>
+            let n = if la.items.len() < ra.items.len(): la.items.len() else: ra.items.len()
+            for i in 0..n:
+                c := compare(la.items[i], ra.items[i])
+                if c != 0:
+                    return c
+            cmp_i(i64(la.items.len()), i64(ra.items.len()))
+        .Maps(lm, rm) =>
+            lk := sorted_keys(lm.fields)
+            rk := sorted_keys(rm.fields)
+            let n = if lk.len() < rk.len(): lk.len() else: rk.len()
+            for i in 0..n:
+                if lk[i] != rk[i]:
+                    return if lk[i] < rk[i]: -1 else: 1
+            if lk.len() != rk.len():
+                return cmp_i(i64(lk.len()), i64(rk.len()))
+            for k in lk:
+                c := compare(lm.fields[k], rm.fields[k])
+                if c != 0:
+                    return c
+            0
+        .Fallback(a, b) => cmp_i(type_index(a), type_index(b))
+
+fn compare_floats(l: f64, r: f64) -> i32:
+    if lt(l, r):
+        return -1
+    if l == r:
+        return 0
+    1
+
+fn compare_int_float(l: i64, r: f64) -> i32:
+    if (l >= -9007199254740992 && l <= 9007199254740992) || r.is_nan():
+        return compare_floats(f64(l), r)
+    compare_big_float(bigint.from_i64(l), r)
+
+fn compare_big_int_float(l: BigInt, r: f64) -> i32:
+    if r.is_nan():
+        return 1
+    compare_big_float(l, r)
+
+## big.Float(l).Cmp(big.NewFloat(r)), exactly.
+fn compare_big_float(l: BigInt, r: f64) -> i32:
+    if !r.is_finite():
+        return if r > 0.0: -1 else: 1
+    c := bigint.compare(l, bigint.from_f64_trunc(r))
+    if c != 0:
+        return c
+    frac := r - r.trunc()
+    if frac > 0.0: -1 else if frac < 0.0: 1 else: 0
+
+pub fn lt(l: f64, r: f64) -> bool:
+    l < r || l.is_nan()
+
+pub fn type_index(v: Value) -> i64:
+    match v:
+        .Null => 0
+        .Bool(b) => if !b: 1 else: 2
+        .Int(_) => 3
+        .Float(_) => 3
+        .Big(_) => 3
+        .Number(_) => 3
+        .Str(_) => 4
+        .Arr(_) => 5
+        .Obj(_) => 6
+        .Hole => 7

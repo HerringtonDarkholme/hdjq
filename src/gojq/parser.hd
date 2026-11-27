@@ -1,0 +1,486 @@
+## Port of gojq/parser.go: the goyacc parser driver and the grammar actions
+## of parser.go.y. The tables are in parser_tables.hd.
+use pkg.gojq.parser_tables.{yy_exca, yy_act, yy_pact, yy_pgo, yy_r1, yy_r2, yy_chk, yy_def, yy_tok1, yy_tok1_len, yy_tok2, yy_tok2_len, yy_last, yy_private, yy_flag}
+use pkg.gojq.lexer.{Lexer, LexVal, new_lexer}
+use pkg.gojq.error.JqError
+use pkg.gojq.query.{Query, Term, TermType, Operator, Import, FuncDef, Pattern, PatternObject, Index, Func, StringT, Object, ObjectKeyVal, Array, Suffix, If, IfElif, Try, Reduce, Foreach, Label, Unary, ConstTerm, ConstObject, ConstObjectKeyVal, ConstArray}
+
+## The `value any` of yySymType.
+pub enum SymValue:
+    Nil
+    Query(q: (*mut Query)?)
+    Queries(qs: List[*mut Query])
+    Term(t: *mut Term)
+    Import(i: *mut Import)
+    Imports(imps: List[*mut Import])
+    FuncDef(f: *mut FuncDef)
+    FuncDefs(fs: List[*mut FuncDef])
+    Strings(ss: List[string])
+    Pattern(p: *mut Pattern)
+    Patterns(ps: List[*mut Pattern])
+    PatternObject(p: *mut PatternObject)
+    PatternObjects(ps: List[*mut PatternObject])
+    Str(s: *mut StringT)
+    Suffix(s: *mut Suffix)
+    IfElifs(es: List[*mut IfElif])
+    ObjectKeyVal(kv: *mut ObjectKeyVal)
+    ObjectKeyVals(kvs: List[*mut ObjectKeyVal])
+    ConstTerm(t: *mut ConstTerm)
+    ConstTerms(ts: List[*mut ConstTerm])
+    ConstObject(o: (*mut ConstObject)?)
+    ConstObjectKeyVal(kv: *mut ConstObjectKeyVal)
+    ConstObjectKeyVals(kvs: List[*mut ConstObjectKeyVal])
+    ConstArray(a: *mut ConstArray)
+
+struct SymType:
+    yys: i64 = 0
+    value: SymValue = .Nil
+    token: string = ""
+    operator: Operator = .OpNone
+
+## Parse a query string, and returns the query struct.
+pub fn parse(src: string) -> Result[*mut Query, JqError]:
+    l := new_lexer(src)
+    if yy_parse(l) > 0:
+        return .Err(l.err.unwrap_or(.Message("syntax error")))
+    match l.result:
+        .Some(q) => .Ok(q)
+        .None => .Err(.Message("syntax error"))
+
+# typed accessors for $n
+fn q(s: SymType) -> *mut Query:
+    match s.value:
+        .Query(.Some(x)) => x
+        _ => panic("parser: expected a query")
+
+fn q_opt(s: SymType) -> (*mut Query)?:
+    match s.value:
+        .Query(x) => x
+        _ => .None
+
+fn t(s: SymType) -> *mut Term:
+    match s.value:
+        .Term(x) => x
+        _ => panic("parser: expected a term")
+
+fn str_v(s: SymType) -> *mut StringT:
+    match s.value:
+        .Str(x) => x
+        _ => panic("parser: expected a string")
+
+fn pat(s: SymType) -> *mut Pattern:
+    match s.value:
+        .Pattern(x) => x
+        _ => panic("parser: expected a pattern")
+
+fn pats(s: SymType) -> List[*mut Pattern]:
+    match s.value:
+        .Patterns(x) => x
+        _ => panic("parser: expected patterns")
+
+fn suffix(s: SymType) -> *mut Suffix:
+    match s.value:
+        .Suffix(x) => x
+        _ => panic("parser: expected a suffix")
+
+fn queries(s: SymType) -> List[*mut Query]:
+    match s.value:
+        .Queries(x) => x
+        _ => panic("parser: expected queries")
+
+fn const_object(s: SymType) -> (*mut ConstObject)?:
+    match s.value:
+        .ConstObject(x) => x
+        _ => panic("parser: expected a const object")
+
+fn const_term(s: SymType) -> *mut ConstTerm:
+    match s.value:
+        .ConstTerm(x) => x
+        _ => panic("parser: expected a const term")
+
+fn binary(l: SymType, op: Operator, r: SymType) -> SymValue:
+    .Query(.Some(box(Query { left: .Some(q(l)), op: op, right: .Some(q(r)) })))
+
+fn term_value(typ: TermType) -> SymValue:
+    .Term(box(Term { typ: typ }))
+
+fn yylex1(lex: *mut Lexer, lval: &mut SymType) -> (i64, i64):
+    let mut lv = LexVal {}
+    ch := lex.lex(&mut lv)
+    lval.token = lv.token
+    lval.operator = lv.operator
+    let token = 0i64
+    if ch <= 0:
+        token = yy_tok1(0)
+    else if ch < yy_tok1_len():
+        token = yy_tok1(ch)
+    else if ch >= yy_private() && ch < yy_private() + yy_tok2_len():
+        token = yy_tok2(ch - yy_private())
+    if token == 0:
+        token = yy_tok2(1)
+    (ch, token)
+
+fn yy_parse(yylex: *mut Lexer) -> i64:
+    let mut yy_s: List[SymType] = []
+    let yyn = 0i64
+    let mut yy_val = SymType {}
+    let mut lval = SymType {}
+    let yystate = 0i64
+    let ychar = -1i64
+    let yytoken = -1i64
+    let yyp = -1i64
+    let err_flag = 0
+    # 0: yystack, 1: yynewstate, 2: yydefault
+    let step = 0
+    while true:
+        if step == 0:
+            yyp += 1
+            yy_val.yys = yystate
+            if yyp < i64(yy_s.len()):
+                yy_s[usize(yyp)] = yy_val
+            else:
+                yy_s.push(yy_val)
+            step = 1
+            continue
+        if step == 1:
+            yyn = yy_pact(yystate)
+            if yyn <= yy_flag():
+                step = 2
+                continue
+            if ychar < 0:
+                let (c, tk) = yylex1(yylex, &mut lval)
+                ychar = c
+                yytoken = tk
+            yyn += yytoken
+            if yyn < 0 || yyn >= yy_last():
+                step = 2
+                continue
+            yyn = yy_act(yyn)
+            if yy_chk(yyn) == yytoken:
+                ychar = -1
+                yytoken = -1
+                yy_val = lval
+                yystate = yyn
+                if err_flag > 0:
+                    err_flag -= 1
+                step = 0
+                continue
+            step = 2
+            continue
+        # yydefault
+        yyn = yy_def(yystate)
+        if yyn == -2:
+            if ychar < 0:
+                let (c, tk) = yylex1(yylex, &mut lval)
+                ychar = c
+                yytoken = tk
+            let xi = 0i64
+            while true:
+                if yy_exca(xi) == -1 && yy_exca(xi + 1) == yystate:
+                    break
+                xi += 2
+            xi += 2
+            while true:
+                yyn = yy_exca(xi)
+                if yyn < 0 || yyn == yytoken:
+                    break
+                xi += 2
+            yyn = yy_exca(xi + 1)
+            if yyn < 0:
+                return 0
+        if yyn == 0:
+            # gojq never recovers: report the error and stop
+            yylex.error()
+            return 1
+        # reduce by production yyn
+        yynt := yyn
+        yypt := yyp
+        yyp -= yy_r2(yyn)
+        yy_val = if yyp + 1 < i64(yy_s.len()): yy_s[usize(yyp + 1)] else: SymType {}
+        yyn = yy_r1(yyn)
+        yyg := yy_pgo(yyn)
+        yyj := yyg + yy_s[usize(yyp)].yys + 1
+        if yyj >= yy_last():
+            yystate = yy_act(yyg)
+        else:
+            yystate = yy_act(yyj)
+            if yy_chk(yystate) != -yyn:
+                yystate = yy_act(yyg)
+        action(yylex, yynt, yy_s, yypt, &mut yy_val)
+        step = 0
+    0
+
+## $n of the production being reduced (yyDollar[n] = yyS[yypt-len+n]).
+fn dollar(s: List[SymType], yypt: i64, len: i64, n: i64) -> SymType:
+    s[usize(yypt - len + n)]
+
+fn action(yylex: *mut Lexer, yynt: i64, s: List[SymType], p: i64, v: &mut SymType) -> void:
+    match yynt:
+        1 =>
+            query := q(dollar(s, p, 3, 3))
+            query.meta = const_object(dollar(s, p, 3, 1))
+            match dollar(s, p, 3, 2).value:
+                .Imports(imps) => query.imports = imps
+                _ => pass
+            yylex.result = .Some(query)
+        2 => v.value = .ConstObject(.None)
+        3 => v.value = dollar(s, p, 3, 2).value
+        4 => v.value = .Imports([])
+        5 =>
+            let mut imps: List[*mut Import] = match dollar(s, p, 2, 1).value:
+                .Imports(x) => x
+                _ => []
+            match dollar(s, p, 2, 2).value:
+                .Import(i) => imps.push(i)
+                _ => pass
+            v.value = .Imports(imps)
+        6 => v.value = .Import(box(Import { import_path: dollar(s, p, 6, 2).token, import_alias: dollar(s, p, 6, 4).token, meta: const_object(dollar(s, p, 6, 5)) }))
+        7 => v.value = .Import(box(Import { include_path: dollar(s, p, 4, 2).token, meta: const_object(dollar(s, p, 4, 3)) }))
+        8 => v.value = .ConstObject(.None)
+        10 =>
+            let mut fds: List[*mut FuncDef] = match dollar(s, p, 1, 1).value:
+                .FuncDefs(x) => x
+                _ => []
+            fds.reverse()
+            v.value = .Query(.Some(box(Query { func_defs: fds })))
+        12 => v.value = .FuncDefs([])
+        13 =>
+            let mut fds: List[*mut FuncDef] = match dollar(s, p, 2, 2).value:
+                .FuncDefs(x) => x
+                _ => []
+            match dollar(s, p, 2, 1).value:
+                .FuncDef(f) => fds.push(f)
+                _ => pass
+            v.value = .FuncDefs(fds)
+        14 => v.value = .FuncDef(box(FuncDef { name: dollar(s, p, 5, 2).token, body: q(dollar(s, p, 5, 4)) }))
+        15 =>
+            let args: List[string] = match dollar(s, p, 8, 4).value:
+                .Strings(x) => x
+                _ => []
+            v.value = .FuncDef(box(FuncDef { name: dollar(s, p, 8, 2).token, args: args, body: q(dollar(s, p, 8, 7)) }))
+        16 => v.value = .Strings([dollar(s, p, 1, 1).token])
+        17 =>
+            let mut xs: List[string] = match dollar(s, p, 3, 1).value:
+                .Strings(x) => x
+                _ => []
+            xs.push(dollar(s, p, 3, 3).token)
+            v.value = .Strings(xs)
+        20 =>
+            query := q(dollar(s, p, 2, 2))
+            match dollar(s, p, 2, 1).value:
+                .FuncDef(f) => query.func_defs.insert(0, f)
+                _ => pass
+            v.value = .Query(.Some(query))
+        21 => v.value = binary(dollar(s, p, 3, 1), .OpPipe, dollar(s, p, 3, 3))
+        22 => v.value = .Query(.Some(box(Query { left: .Some(q(dollar(s, p, 5, 1))), op: .OpPipe, right: .Some(q(dollar(s, p, 5, 5))), patterns: pats(dollar(s, p, 5, 3)) })))
+        23 => v.value = .Query(.Some(box(Query { term: .Some(box(Term { typ: .TermTypeLabel, label: .Some(box(Label { ident: dollar(s, p, 4, 2).token, body: q(dollar(s, p, 4, 4)) })) })) })))
+        24 => v.value = binary(dollar(s, p, 3, 1), .OpComma, dollar(s, p, 3, 3))
+        26 => v.value = binary(dollar(s, p, 3, 1), dollar(s, p, 3, 2).operator, dollar(s, p, 3, 3))
+        27 => v.value = binary(dollar(s, p, 3, 1), dollar(s, p, 3, 2).operator, dollar(s, p, 3, 3))
+        28 => v.value = binary(dollar(s, p, 3, 1), .OpOr, dollar(s, p, 3, 3))
+        29 => v.value = binary(dollar(s, p, 3, 1), .OpAnd, dollar(s, p, 3, 3))
+        30 => v.value = binary(dollar(s, p, 3, 1), dollar(s, p, 3, 2).operator, dollar(s, p, 3, 3))
+        31 => v.value = binary(dollar(s, p, 3, 1), .OpAdd, dollar(s, p, 3, 3))
+        32 => v.value = binary(dollar(s, p, 3, 1), .OpSub, dollar(s, p, 3, 3))
+        33 => v.value = binary(dollar(s, p, 3, 1), .OpMul, dollar(s, p, 3, 3))
+        34 => v.value = binary(dollar(s, p, 3, 1), .OpDiv, dollar(s, p, 3, 3))
+        35 => v.value = binary(dollar(s, p, 3, 1), .OpMod, dollar(s, p, 3, 3))
+        36 => v.value = .Query(.Some(box(Query { term: .Some(t(dollar(s, p, 1, 1))) })))
+        37 => v.value = .Patterns([pat(dollar(s, p, 1, 1))])
+        38 =>
+            let mut ps = pats(dollar(s, p, 4, 1))
+            ps.push(pat(dollar(s, p, 4, 4)))
+            v.value = .Patterns(ps)
+        39 => v.value = .Pattern(box(Pattern { name: dollar(s, p, 1, 1).token }))
+        40 => v.value = .Pattern(box(Pattern { array: pats(dollar(s, p, 3, 2)) }))
+        41 =>
+            let objs: List[*mut PatternObject] = match dollar(s, p, 3, 2).value:
+                .PatternObjects(x) => x
+                _ => []
+            v.value = .Pattern(box(Pattern { object: objs }))
+        42 => v.value = .Patterns([pat(dollar(s, p, 1, 1))])
+        43 =>
+            let mut ps = pats(dollar(s, p, 3, 1))
+            ps.push(pat(dollar(s, p, 3, 3)))
+            v.value = .Patterns(ps)
+        44 =>
+            match dollar(s, p, 1, 1).value:
+                .PatternObject(o) => v.value = .PatternObjects([o])
+                _ => pass
+        45 =>
+            let mut os: List[*mut PatternObject] = match dollar(s, p, 3, 1).value:
+                .PatternObjects(x) => x
+                _ => []
+            match dollar(s, p, 3, 3).value:
+                .PatternObject(o) => os.push(o)
+                _ => pass
+            v.value = .PatternObjects(os)
+        46 => v.value = .PatternObject(box(PatternObject { key: dollar(s, p, 3, 1).token, val: .Some(pat(dollar(s, p, 3, 3))) }))
+        47 => v.value = .PatternObject(box(PatternObject { key_string: .Some(str_v(dollar(s, p, 3, 1))), val: .Some(pat(dollar(s, p, 3, 3))) }))
+        48 => v.value = .PatternObject(box(PatternObject { key_query: .Some(q(dollar(s, p, 5, 2))), val: .Some(pat(dollar(s, p, 5, 5))) }))
+        49 => v.value = .PatternObject(box(PatternObject { key: dollar(s, p, 1, 1).token }))
+        50 => v.value = term_value(.TermTypeIdentity)
+        51 => v.value = term_value(.TermTypeRecurse)
+        52 => v.value = .Term(box(Term { typ: .TermTypeIndex, index: .Some(box(Index { name: dollar(s, p, 1, 1).token })) }))
+        53 =>
+            sf := suffix(dollar(s, p, 2, 2))
+            if sf.iter:
+                v.value = .Term(box(Term { typ: .TermTypeIdentity, suffix_list: [sf] }))
+            else:
+                v.value = .Term(box(Term { typ: .TermTypeIndex, index: sf.index }))
+        54 => v.value = .Term(box(Term { typ: .TermTypeIndex, index: .Some(box(Index { str: .Some(str_v(dollar(s, p, 2, 2))) })) }))
+        55 => v.value = term_value(.TermTypeNull)
+        56 => v.value = term_value(.TermTypeTrue)
+        57 => v.value = term_value(.TermTypeFalse)
+        58 => v.value = .Term(box(Term { typ: .TermTypeFunc, func: .Some(box(Func { name: dollar(s, p, 1, 1).token })) }))
+        59 => v.value = .Term(box(Term { typ: .TermTypeFunc, func: .Some(box(Func { name: dollar(s, p, 4, 1).token, args: queries(dollar(s, p, 4, 3)) })) }))
+        60 => v.value = .Term(box(Term { typ: .TermTypeFunc, func: .Some(box(Func { name: dollar(s, p, 1, 1).token })) }))
+        61 => v.value = .Term(box(Term { typ: .TermTypeObject, object: .Some(box(Object {})) }))
+        62 =>
+            let kvs: List[*mut ObjectKeyVal] = match dollar(s, p, 3, 2).value:
+                .ObjectKeyVals(x) => x
+                _ => []
+            v.value = .Term(box(Term { typ: .TermTypeObject, object: .Some(box(Object { key_vals: kvs })) }))
+        63 =>
+            let kvs: List[*mut ObjectKeyVal] = match dollar(s, p, 4, 2).value:
+                .ObjectKeyVals(x) => x
+                _ => []
+            v.value = .Term(box(Term { typ: .TermTypeObject, object: .Some(box(Object { key_vals: kvs })) }))
+        64 => v.value = .Term(box(Term { typ: .TermTypeArray, array: .Some(box(Array {})) }))
+        65 => v.value = .Term(box(Term { typ: .TermTypeArray, array: .Some(box(Array { query: .Some(q(dollar(s, p, 3, 2))) })) }))
+        66 => v.value = .Term(box(Term { typ: .TermTypeNumber, number: dollar(s, p, 1, 1).token }))
+        67 => v.value = .Term(box(Term { typ: .TermTypeUnary, unary: .Some(box(Unary { op: .OpAdd, term: t(dollar(s, p, 2, 2)) })) }))
+        68 => v.value = .Term(box(Term { typ: .TermTypeUnary, unary: .Some(box(Unary { op: .OpSub, term: t(dollar(s, p, 2, 2)) })) }))
+        69 => v.value = .Term(box(Term { typ: .TermTypeFormat, format: dollar(s, p, 1, 1).token }))
+        70 => v.value = .Term(box(Term { typ: .TermTypeFormat, format: dollar(s, p, 2, 1).token, str: .Some(str_v(dollar(s, p, 2, 2))) }))
+        71 => v.value = .Term(box(Term { typ: .TermTypeString, str: .Some(str_v(dollar(s, p, 1, 1))) }))
+        72 =>
+            let elifs: List[*mut IfElif] = match dollar(s, p, 7, 5).value:
+                .IfElifs(x) => x
+                _ => []
+            v.value = .Term(box(Term { typ: .TermTypeIf, if_: .Some(box(If { cond: q(dollar(s, p, 7, 2)), then_: q(dollar(s, p, 7, 4)), elif: elifs, else_: q_opt(dollar(s, p, 7, 6)) })) }))
+        73 => v.value = .Term(box(Term { typ: .TermTypeTry, try_: .Some(box(Try { body: q(dollar(s, p, 3, 2)), catch: q_opt(dollar(s, p, 3, 3)) })) }))
+        74 => v.value = .Term(box(Term { typ: .TermTypeReduce, reduce: .Some(box(Reduce { query: q(dollar(s, p, 9, 2)), patterns: pats(dollar(s, p, 9, 4)), start: q(dollar(s, p, 9, 6)), update: q(dollar(s, p, 9, 8)) })) }))
+        75 => v.value = .Term(box(Term { typ: .TermTypeForeach, foreach: .Some(box(Foreach { query: q(dollar(s, p, 9, 2)), patterns: pats(dollar(s, p, 9, 4)), start: q(dollar(s, p, 9, 6)), update: q(dollar(s, p, 9, 8)) })) }))
+        76 => v.value = .Term(box(Term { typ: .TermTypeForeach, foreach: .Some(box(Foreach { query: q(dollar(s, p, 11, 2)), patterns: pats(dollar(s, p, 11, 4)), start: q(dollar(s, p, 11, 6)), update: q(dollar(s, p, 11, 8)), extract: .Some(q(dollar(s, p, 11, 10))) })) }))
+        77 => v.value = .Term(box(Term { typ: .TermTypeBreak, break_: dollar(s, p, 2, 2).token }))
+        78 => v.value = .Term(box(Term { typ: .TermTypeQuery, query: .Some(q(dollar(s, p, 3, 2))) }))
+        79 =>
+            tm := t(dollar(s, p, 2, 1))
+            tm.suffix_list.push(box(Suffix { index: .Some(box(Index { name: dollar(s, p, 2, 2).token })) }))
+        80 =>
+            tm := t(dollar(s, p, 2, 1))
+            tm.suffix_list.push(suffix(dollar(s, p, 2, 2)))
+        81 =>
+            tm := t(dollar(s, p, 2, 1))
+            tm.suffix_list.push(box(Suffix { optional: true }))
+        82 =>
+            tm := t(dollar(s, p, 3, 1))
+            tm.suffix_list.push(suffix(dollar(s, p, 3, 3)))
+        83 =>
+            tm := t(dollar(s, p, 3, 1))
+            tm.suffix_list.push(box(Suffix { index: .Some(box(Index { str: .Some(str_v(dollar(s, p, 3, 3))) })) }))
+        84 => v.value = .Str(box(StringT { str: dollar(s, p, 1, 1).token }))
+        85 => v.value = .Str(box(StringT { queries: .Some(queries(dollar(s, p, 3, 2))) }))
+        86 => v.value = .Queries([])
+        87 =>
+            let mut qs = queries(dollar(s, p, 2, 1))
+            qs.push(box(Query { term: .Some(box(Term { typ: .TermTypeString, str: .Some(box(StringT { str: dollar(s, p, 2, 2).token })) })) }))
+            v.value = .Queries(qs)
+        88 =>
+            yylex.set_in_string()
+            let mut qs = queries(dollar(s, p, 4, 1))
+            qs.push(box(Query { term: .Some(box(Term { typ: .TermTypeQuery, query: .Some(q(dollar(s, p, 4, 3))) })) }))
+            v.value = .Queries(qs)
+        93 => v.value = .Suffix(box(Suffix { iter: true }))
+        94 => v.value = .Suffix(box(Suffix { index: .Some(box(Index { start: .Some(q(dollar(s, p, 3, 2))) })) }))
+        95 => v.value = .Suffix(box(Suffix { index: .Some(box(Index { start: .Some(q(dollar(s, p, 4, 2))), is_slice: true })) }))
+        96 => v.value = .Suffix(box(Suffix { index: .Some(box(Index { end: .Some(q(dollar(s, p, 4, 3))), is_slice: true })) }))
+        97 => v.value = .Suffix(box(Suffix { index: .Some(box(Index { start: .Some(q(dollar(s, p, 5, 2))), end: .Some(q(dollar(s, p, 5, 4))), is_slice: true })) }))
+        98 => v.value = .Queries([q(dollar(s, p, 1, 1))])
+        99 =>
+            let mut qs = queries(dollar(s, p, 3, 1))
+            qs.push(q(dollar(s, p, 3, 3)))
+            v.value = .Queries(qs)
+        100 => v.value = .IfElifs([])
+        101 =>
+            let mut es: List[*mut IfElif] = match dollar(s, p, 5, 1).value:
+                .IfElifs(x) => x
+                _ => []
+            es.push(box(IfElif { cond: q(dollar(s, p, 5, 3)), then_: q(dollar(s, p, 5, 5)) }))
+            v.value = .IfElifs(es)
+        102 => v.value = .Query(.None)
+        103 => v.value = dollar(s, p, 2, 2).value
+        104 => v.value = .Query(.None)
+        105 => v.value = dollar(s, p, 2, 2).value
+        106 =>
+            match dollar(s, p, 1, 1).value:
+                .ObjectKeyVal(kv) => v.value = .ObjectKeyVals([kv])
+                _ => pass
+        107 =>
+            let mut kvs: List[*mut ObjectKeyVal] = match dollar(s, p, 3, 1).value:
+                .ObjectKeyVals(x) => x
+                _ => []
+            match dollar(s, p, 3, 3).value:
+                .ObjectKeyVal(kv) => kvs.push(kv)
+                _ => pass
+            v.value = .ObjectKeyVals(kvs)
+        108 => v.value = .ObjectKeyVal(box(ObjectKeyVal { key: dollar(s, p, 3, 1).token, val: .Some(q(dollar(s, p, 3, 3))) }))
+        109 => v.value = .ObjectKeyVal(box(ObjectKeyVal { key_string: .Some(str_v(dollar(s, p, 3, 1))), val: .Some(q(dollar(s, p, 3, 3))) }))
+        110 => v.value = .ObjectKeyVal(box(ObjectKeyVal { key_query: .Some(q(dollar(s, p, 5, 2))), val: .Some(q(dollar(s, p, 5, 5))) }))
+        111 => v.value = .ObjectKeyVal(box(ObjectKeyVal { key: dollar(s, p, 1, 1).token }))
+        112 => v.value = .ObjectKeyVal(box(ObjectKeyVal { key_string: .Some(str_v(dollar(s, p, 1, 1))) }))
+        116 => v.value = binary(dollar(s, p, 3, 1), .OpPipe, dollar(s, p, 3, 3))
+        118 =>
+            match dollar(s, p, 1, 1).value:
+                .ConstObject(o) => v.value = .ConstTerm(box(ConstTerm { object: o }))
+                _ => pass
+        119 =>
+            match dollar(s, p, 1, 1).value:
+                .ConstArray(a) => v.value = .ConstTerm(box(ConstTerm { array: .Some(a) }))
+                _ => pass
+        120 => v.value = .ConstTerm(box(ConstTerm { number: dollar(s, p, 1, 1).token }))
+        121 => v.value = .ConstTerm(box(ConstTerm { str: dollar(s, p, 1, 1).token }))
+        122 => v.value = .ConstTerm(box(ConstTerm { null: true }))
+        123 => v.value = .ConstTerm(box(ConstTerm { true_: true }))
+        124 => v.value = .ConstTerm(box(ConstTerm { false_: true }))
+        125 => v.value = .ConstObject(.Some(box(ConstObject {})))
+        126 =>
+            let kvs: List[*mut ConstObjectKeyVal] = match dollar(s, p, 3, 2).value:
+                .ConstObjectKeyVals(x) => x
+                _ => []
+            v.value = .ConstObject(.Some(box(ConstObject { key_vals: kvs })))
+        127 =>
+            let kvs: List[*mut ConstObjectKeyVal] = match dollar(s, p, 4, 2).value:
+                .ConstObjectKeyVals(x) => x
+                _ => []
+            v.value = .ConstObject(.Some(box(ConstObject { key_vals: kvs })))
+        128 =>
+            match dollar(s, p, 1, 1).value:
+                .ConstObjectKeyVal(kv) => v.value = .ConstObjectKeyVals([kv])
+                _ => pass
+        129 =>
+            let mut kvs: List[*mut ConstObjectKeyVal] = match dollar(s, p, 3, 1).value:
+                .ConstObjectKeyVals(x) => x
+                _ => []
+            match dollar(s, p, 3, 3).value:
+                .ConstObjectKeyVal(kv) => kvs.push(kv)
+                _ => pass
+            v.value = .ConstObjectKeyVals(kvs)
+        130 => v.value = .ConstObjectKeyVal(box(ConstObjectKeyVal { key: dollar(s, p, 3, 1).token, val: const_term(dollar(s, p, 3, 3)) }))
+        131 => v.value = .ConstObjectKeyVal(box(ConstObjectKeyVal { key: dollar(s, p, 3, 1).token, val: const_term(dollar(s, p, 3, 3)) }))
+        132 => v.value = .ConstObjectKeyVal(box(ConstObjectKeyVal { key_string: dollar(s, p, 3, 1).token, val: const_term(dollar(s, p, 3, 3)) }))
+        133 => v.value = .ConstArray(box(ConstArray {}))
+        134 =>
+            let ts: List[*mut ConstTerm] = match dollar(s, p, 3, 2).value:
+                .ConstTerms(x) => x
+                _ => []
+            v.value = .ConstArray(box(ConstArray { elems: ts }))
+        135 => v.value = .ConstTerms([const_term(dollar(s, p, 1, 1))])
+        136 =>
+            let mut ts: List[*mut ConstTerm] = match dollar(s, p, 3, 1).value:
+                .ConstTerms(x) => x
+                _ => []
+            ts.push(const_term(dollar(s, p, 3, 3)))
+            v.value = .ConstTerms(ts)
+        _ => pass

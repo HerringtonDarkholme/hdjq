@@ -1,0 +1,61 @@
+## Port of gojq/cli/color.go: noColor and the colors are package variables.
+use pkg.goshim.strconv.quote
+
+pub struct Colors:
+    pub no_color: bool = false
+    pub reset: string? = .Some(new_color("0"))
+    pub null: string? = .Some(new_color("90"))
+    pub false_: string? = .Some(new_color("33"))
+    pub true_: string? = .Some(new_color("33"))
+    pub number: string? = .Some(new_color("36"))
+    pub str: string? = .Some(new_color("32"))
+    pub object_key: string? = .Some(new_color("34;1"))
+    pub array: string? = .None
+    pub object: string? = .None
+
+let COLORS = box(Colors {})
+
+## The package's color variables.
+pub fn colors() -> *mut Colors:
+    COLORS
+
+pub fn new_color(c: string) -> string:
+    "\u{1b}[" + c + "m"
+
+fn valid_color(x: string) -> bool:
+    let num = false
+    for c in x.chars():
+        if '0' <= c && c <= '9':
+            num = true
+        else if c == ';' && num:
+            num = false
+        else:
+            return false
+    num
+
+## setColors
+pub fn set_colors(cs: *mut Colors, colors0: string) -> Result[void, string]:
+    let colors = colors0
+    let mut targets: List[string?] = []
+    for _ in 0..8:
+        let color = colors
+        match colors.split_once(":"):
+            .Some((a, b)) =>
+                color = a
+                colors = b
+            .None => colors = ""
+        if color != "":
+            if !valid_color(color):
+                return .Err("invalid color: ${quote(color)}")
+            targets.push(.Some(new_color(color)))
+        else:
+            targets.push(.None)
+    cs.null = targets[0]
+    cs.false_ = targets[1]
+    cs.true_ = targets[2]
+    cs.number = targets[3]
+    cs.str = targets[4]
+    cs.object_key = targets[5]
+    cs.array = targets[6]
+    cs.object = targets[7]
+    .Ok(())

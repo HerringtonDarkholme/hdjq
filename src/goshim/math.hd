@@ -1,0 +1,28 @@
+## The two functions of Go's math package that gomath.hd leaves out
+## (math/floor.go Round, math/dim.go Dim). Floor, Ceil, Trunc, Sqrt, Abs,
+## Copysign and RoundToEven are exact IEEE operations, so hd's f64 methods
+## give Go's results.
+
+## math.Round: half away from zero.
+pub fn round(x: f64) -> f64:
+    let bits = x.to_bits()
+    let e = (bits >> 52) & u64(0x7FF)
+    if e < 1023:
+        # round abs(x) < 1 including denormals
+        bits = bits & (u64(1) << 63)
+        if e == 1022:
+            bits = bits | u64(0x3FF0000000000000)
+    else if e < 1023 + 52:
+        # round any abs(x) >= 1 containing a fractional component [0,1)
+        e2 := e - 1023
+        bits += (u64(1) << 51) >> u32(e2)
+        frac := ((u64(1) << 52) - 1) >> u32(e2)
+        bits = bits & (frac ^ u64(0xFFFFFFFFFFFFFFFF))
+    f64::from_bits(bits)
+
+## math.Dim: the maximum of x-y or 0.
+pub fn dim(x: f64, y: f64) -> f64:
+    v := x - y
+    if v <= 0.0:
+        return 0.0
+    v

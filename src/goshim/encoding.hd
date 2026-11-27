@@ -1,0 +1,240 @@
+## Shims for the small Go packages gojq's func.go uses: encoding/base64,
+## net/url (query escaping), strings.Replacer, unicode.IsSpace and the
+## conversion of bytes to a string (Go keeps invalid UTF-8; hd strings are
+## valid UTF-8, so invalid bytes become U+FFFD here, as gojq's encoder
+## would print them).
+use std.text.StringBuilder
+use std.convert.TryFrom
+use pkg.goshim.strconv.quote
+use pkg.goshim.regexp.utf8_len
+
+B64 := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+## base64.StdEncoding.EncodeToString
+pub fn base64_encode(bytes: List[u8]) -> string:
+    out := StringBuilder::new()
+    let i = 0usize
+    let table: List[u8] = B64.bytes().collect()
+    while i + 2 < bytes.len():
+        n := (u32(bytes[i]) << 16) | (u32(bytes[i + 1]) << 8) | u32(bytes[i + 2])
+        out.push_ascii(table[usize((n >> 18) & 63)])
+        out.push_ascii(table[usize((n >> 12) & 63)])
+        out.push_ascii(table[usize((n >> 6) & 63)])
+        out.push_ascii(table[usize(n & 63)])
+        i += 3
+    rest := bytes.len() - i
+    if rest == 1:
+        n := u32(bytes[i]) << 16
+        out.push_ascii(table[usize((n >> 18) & 63)])
+        out.push_ascii(table[usize((n >> 12) & 63)])
+        out.push("==")
+    else if rest == 2:
+        n := (u32(bytes[i]) << 16) | (u32(bytes[i + 1]) << 8)
+        out.push_ascii(table[usize((n >> 18) & 63)])
+        out.push_ascii(table[usize((n >> 12) & 63)])
+        out.push_ascii(table[usize((n >> 6) & 63)])
+        out.push("=")
+    out.build()
+
+fn b64_value(b: u8) -> u32?:
+    if b >= 65 && b <= 90:
+        return .Some(u32(b - 65))
+    if b >= 97 && b <= 122:
+        return .Some(u32(b - 71))
+    if b >= 48 && b <= 57:
+        return .Some(u32(b + 4))
+    if b == 43:
+        return .Some(62)
+    if b == 47:
+        return .Some(63)
+    .None
+
+## base64.RawStdEncoding.DecodeString; the error is Go's CorruptInputError text.
+pub fn base64_raw_decode(text: string) -> Result[List[u8], string]:
+    let bytes: List[u8] = text.bytes().collect()
+    let mut out: List[u8] = []
+    let acc: u32 = 0
+    let bits: u32 = 0
+    for (i, b) in bytes.iter().enumerate():
+        match b64_value(b):
+            .Some(d) =>
+                acc = (acc << 6) | d
+                bits += 6
+                if bits >= 8:
+                    bits -= 8
+                    out.push(u8((acc >> bits) & 255))
+                    acc = acc & ((1u32 << bits) - 1)
+            .None => return .Err("illegal base64 data at input byte $i")
+    if bytes.len() % 4 == 1:
+        return .Err("illegal base64 data at input byte ${bytes.len() - 1}")
+    .Ok(out)
+
+fn hex_digit(b: u8) -> u32?:
+    if b >= 48 && b <= 57:
+        return .Some(u32(b - 48))
+    if b >= 97 && b <= 102:
+        return .Some(u32(b - 87))
+    if b >= 65 && b <= 70:
+        return .Some(u32(b - 55))
+    .None
+
+## url.QueryEscape
+pub fn query_escape(s: string) -> string:
+    out := StringBuilder::new()
+    hex := "0123456789ABCDEF"
+    for b in go_bytes(s):
+        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45 || b == 95 || b == 46 || b == 126:
+            out.push_ascii(b)
+        else if b == 32:
+            out.push("+")
+        else:
+            out.push("%")
+            out.push(hex.slice(usize(b >> 4), usize(b >> 4) + 1))
+            out.push(hex.slice(usize(b & 15), usize(b & 15) + 1))
+    out.build()
+
+## url.QueryUnescape; the error is Go's EscapeError text.
+pub fn query_unescape(s: string) -> Result[string, string]:
+    let bytes: List[u8] = go_bytes(s)
+    let mut out: List[u8] = []
+    let i = 0usize
+    while i < bytes.len():
+        b := bytes[i]
+        if b == 37:
+            if i + 2 >= bytes.len():
+                return .Err("invalid URL escape ${quote(lossy(bytes.slice(i, bytes.len())))}")
+            match (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])):
+                (.Some(h), .Some(l)) =>
+                    out.push(u8(h * 16 + l))
+                    i += 3
+                _ => return .Err("invalid URL escape ${quote(lossy(bytes.slice(i, i + 3)))}")
+        else if b == 43:
+            out.push(32)
+            i += 1
+        else:
+            out.push(b)
+            i += 1
+    .Ok(lossy(out))
+
+# Go strings may hold bytes that are not UTF-8; hd strings may not. The
+# string(bytes) of the port keeps each such byte b as the character
+# U+10FE00+b (a private-use character from U+10FE80 to U+10FEFF), and the
+# places where Go exposes the byte undo it: go_bytes gives the bytes back,
+# and as text the byte reads as U+FFFD, as Go's utf8 decoding sees it.
+
+MARKER_BASE := u32(0x10FE00)
+
+fn decode_lossy(bytes: List[u8], marker: bool) -> string:
+    match string::from_utf8(bytes):
+        .Ok(s) => s
+        .Err(_) =>
+            out := StringBuilder::new()
+            let i = 0usize
+            while i < bytes.len():
+                b := bytes[i]
+                let width = 1usize
+                if b >= 0xF0:
+                    width = 4
+                else if b >= 0xE0:
+                    width = 3
+                else if b >= 0xC0:
+                    width = 2
+                if i + width <= bytes.len():
+                    match string::from_utf8(bytes.slice(i, i + width)):
+                        .Ok(piece) =>
+                            out.push(piece)
+                            i += width
+                            continue
+                        .Err(_) => pass
+                if marker:
+                    out.push_char(char::try_from(MARKER_BASE + u32(b)).unwrap_or('\u{FFFD}'))
+                else:
+                    out.push_char('\u{FFFD}')
+                i += 1
+            out.build()
+
+## string(bytes): invalid bytes are kept (as markers).
+pub fn lossy(bytes: List[u8]) -> string:
+    decode_lossy(bytes, true)
+
+## Text for display: invalid bytes become U+FFFD.
+pub fn lossy_fffd(bytes: List[u8]) -> string:
+    decode_lossy(bytes, false)
+
+## The invalid byte a character stands for, if it is a marker.
+pub fn marker_byte(c: char) -> u8?:
+    u := c.to_u32()
+    if u >= MARKER_BASE + 0x80 && u <= MARKER_BASE + 0xFF:
+        return .Some(u8(u - MARKER_BASE))
+    .None
+
+## Whether the string may hold markers (they all start with byte F4).
+pub fn may_have_markers(s: string) -> bool:
+    for b in s.bytes():
+        if b == 0xF4:
+            return true
+    false
+
+## []byte(s): the bytes of the Go string.
+pub fn go_bytes(s: string) -> List[u8]:
+    let mut out: List[u8] = []
+    if !may_have_markers(s):
+        out.extend(s.bytes().collect::[List[u8]]())
+        return out
+    for c in s.chars():
+        match marker_byte(c):
+            .Some(b) => out.push(b)
+            .None =>
+                for b in c.to_string().bytes():
+                    out.push(b)
+    out
+
+## The string as a terminal would show Go's bytes: markers as U+FFFD.
+pub fn display(s: string) -> string:
+    if !may_have_markers(s):
+        return s
+    out := StringBuilder::new()
+    for c in s.chars():
+        match marker_byte(c):
+            .Some(_) => out.push_char('\u{FFFD}')
+            .None => out.push_char(c)
+    out.build()
+
+## unicode.IsSpace
+pub fn is_space(c: char) -> bool:
+    c.is_whitespace()
+
+## strings.TrimLeftFunc(s, unicode.IsSpace)
+pub fn trim_left_space(s: string) -> string:
+    for (i, c) in s.char_indices():
+        if !is_space(c):
+            return s.slice(i, s.len())
+    ""
+
+## strings.TrimRightFunc(s, unicode.IsSpace)
+pub fn trim_right_space(s: string) -> string:
+    let end = 0usize
+    for (i, c) in s.char_indices():
+        if !is_space(c):
+            end = i + usize(utf8_len(c))
+    s.slice(0, end)
+
+## strings.TrimSpace
+pub fn trim_space(s: string) -> string:
+    trim_right_space(trim_left_space(s))
+
+## A strings.Replacer whose old strings are single bytes (Go uses its byte
+## string replacer for these): each pair is (old byte, new text).
+pub fn replace_bytes(s: string, pairs: List[(u8, string)]) -> string:
+    out := StringBuilder::new()
+    let start = 0usize
+    let bytes: List[u8] = s.bytes().collect()
+    for (i, b) in bytes.iter().enumerate():
+        for (o, r) in pairs:
+            if o == b:
+                out.push(s.slice(start, i))
+                out.push(r)
+                start = i + 1
+                break
+    out.push(s.slice(start, s.len()))
+    out.build()

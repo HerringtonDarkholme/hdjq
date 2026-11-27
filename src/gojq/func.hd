@@ -1,0 +1,1727 @@
+## Port of gojq/func.go: the internal functions.
+use std.text.StringBuilder
+use std.convert.TryFrom
+use pkg.goshim.value.{Value, ArrBox, ObjBox, Allocator, arr, obj, same}
+use pkg.goshim.bigint
+use pkg.goshim.math
+use pkg.goshim.gomath
+use pkg.goshim.json.{new_decoder, JsonErr}
+use pkg.goshim.regexp
+use pkg.goshim.regexp.Regexp
+use pkg.goshim.time
+use pkg.goshim.time.{Time, Location}
+use pkg.goshim.timefmt
+use pkg.goshim.encoding.{go_bytes, marker_byte, display, base64_encode, base64_raw_decode, query_escape, query_unescape, lossy, trim_left_space, trim_right_space, trim_space, replace_bytes}
+use pkg.goshim.strconv.quote
+use pkg.gojq.code.Callback
+use pkg.gojq.iter.{Item, Iter}
+use pkg.gojq.error.JqError
+use pkg.gojq.number.{to_int, to_float64, parse_number, to_number, float_to_int}
+use pkg.gojq.compare.{compare, lt}
+use pkg.gojq.operator.{binop_type_switch, Binop, func_op_add, func_op_sub, func_op_mul, func_op_div, func_op_mod, func_op_alt, func_op_eq, func_op_ne, func_op_gt, func_op_lt, func_op_ge, func_op_le, func_op_plus, func_op_negate}
+use pkg.gojq.encoder.{json_marshal, sorted_keys}
+use pkg.gojq.typeof.type_of
+use pkg.gojq.lexer.new_lexer
+
+ARGCOUNT0 := 1i64
+ARGCOUNT1 := 2i64
+ARGCOUNT2 := 4i64
+ARGCOUNT3 := 8i64
+
+pub struct Function:
+    pub argcount: i64
+    pub iter: bool
+    pub callback: Callback
+
+impl Function:
+    pub fn accept(&self, cnt: i64) -> bool:
+        (self.argcount & (1i64 << u32(cnt))) != 0
+
+fn fun(argcount: i64, callback: Callback) -> Function:
+    Function { argcount: argcount, iter: false, callback: callback }
+
+fn nil0() -> Function:
+    fun(ARGCOUNT0, .Nil)
+
+fn nil1() -> Function:
+    fun(ARGCOUNT1, .Nil)
+
+fn local(argcount: i64, name: string) -> Function:
+    fun(argcount, .Local(name))
+
+## internalFuncs
+pub fn internal_funcs() -> Map[string, Function]:
+    {
+        "empty": nil0(),
+        "path": nil1(),
+        "env": nil0(),
+        "builtins": nil0(),
+        "input": nil0(),
+        "modulemeta": nil0(),
+        "debug": nil1(),
+        "length": fun(ARGCOUNT0, .Arg0(func_length)),
+        "utf8bytelength": fun(ARGCOUNT0, .Arg0(func_utf8_byte_length)),
+        "keys": fun(ARGCOUNT0, .Arg0(func_keys)),
+        "has": fun(ARGCOUNT1, .Arg1(func_has)),
+        "add": fun(ARGCOUNT0, .Arg0(func_add)),
+        "toboolean": fun(ARGCOUNT0, .Arg0(func_to_boolean)),
+        "tonumber": fun(ARGCOUNT0, .Arg0(func_to_number)),
+        "tostring": fun(ARGCOUNT0, .Arg0(func_to_string)),
+        "type": fun(ARGCOUNT0, .Arg0(func_type)),
+        "reverse": fun(ARGCOUNT0, .Arg0(func_reverse)),
+        "contains": fun(ARGCOUNT1, .Arg1(func_contains)),
+        "inside": fun(ARGCOUNT1, .Arg1(func_inside)),
+        "indices": fun(ARGCOUNT1, .Arg1(func_indices)),
+        "index": fun(ARGCOUNT1, .Arg1(func_index)),
+        "rindex": fun(ARGCOUNT1, .Arg1(func_rindex)),
+        "startswith": fun(ARGCOUNT1, .Arg1(func_starts_with)),
+        "endswith": fun(ARGCOUNT1, .Arg1(func_ends_with)),
+        "ltrimstr": fun(ARGCOUNT1, .Arg1(func_ltrimstr)),
+        "rtrimstr": fun(ARGCOUNT1, .Arg1(func_rtrimstr)),
+        "trimstr": fun(ARGCOUNT1, .Arg1(func_trimstr)),
+        "ltrim": fun(ARGCOUNT0, .Arg0(func_ltrim)),
+        "rtrim": fun(ARGCOUNT0, .Arg0(func_rtrim)),
+        "trim": fun(ARGCOUNT0, .Arg0(func_trim)),
+        "explode": fun(ARGCOUNT0, .Arg0(func_explode)),
+        "implode": fun(ARGCOUNT0, .Arg0(func_implode)),
+        "split": fun(ARGCOUNT1, .Arg1(func_split)),
+        "join": fun(ARGCOUNT1, .Arg1(func_join)),
+        "ascii_downcase": fun(ARGCOUNT0, .Arg0(func_ascii_downcase)),
+        "ascii_upcase": fun(ARGCOUNT0, .Arg0(func_ascii_upcase)),
+        "tojson": fun(ARGCOUNT0, .Arg0(func_to_json)),
+        "fromjson": fun(ARGCOUNT0, .Arg0(func_from_json)),
+        "format": fun(ARGCOUNT1, .Arg1(func_format)),
+        "_tohtml": fun(ARGCOUNT0, .Arg0(func_to_html)),
+        "_touri": fun(ARGCOUNT0, .Arg0(func_to_uri)),
+        "_tourid": fun(ARGCOUNT0, .Arg0(func_to_urid)),
+        "_tocsv": fun(ARGCOUNT0, .Arg0(func_to_csv)),
+        "_totsv": fun(ARGCOUNT0, .Arg0(func_to_tsv)),
+        "_tosh": fun(ARGCOUNT0, .Arg0(func_to_sh)),
+        "_tobase64": fun(ARGCOUNT0, .Arg0(func_to_base64)),
+        "_tobase64d": fun(ARGCOUNT0, .Arg0(func_to_base64d)),
+        "_index": fun(ARGCOUNT2, .Arg2(func_index2)),
+        "_slice": fun(ARGCOUNT3, .Arg3(func_slice)),
+        "_plus": fun(ARGCOUNT0, .Arg0(func_op_plus_item)),
+        "_negate": fun(ARGCOUNT0, .Arg0(func_op_negate_item)),
+        "_add": fun(ARGCOUNT2, .Arg2(op_add)),
+        "_subtract": fun(ARGCOUNT2, .Arg2(op_sub)),
+        "_multiply": fun(ARGCOUNT2, .Arg2(op_mul)),
+        "_divide": fun(ARGCOUNT2, .Arg2(op_div)),
+        "_modulo": fun(ARGCOUNT2, .Arg2(op_mod)),
+        "_alternative": fun(ARGCOUNT2, .Arg2(op_alt)),
+        "_equal": fun(ARGCOUNT2, .Arg2(op_eq)),
+        "_notequal": fun(ARGCOUNT2, .Arg2(op_ne)),
+        "_greater": fun(ARGCOUNT2, .Arg2(op_gt)),
+        "_less": fun(ARGCOUNT2, .Arg2(op_lt)),
+        "_greatereq": fun(ARGCOUNT2, .Arg2(op_ge)),
+        "_lesseq": fun(ARGCOUNT2, .Arg2(op_le)),
+        "flatten": Function { argcount: ARGCOUNT0 | ARGCOUNT1, iter: false, callback: .Args(func_flatten) },
+        "_range": Function { argcount: ARGCOUNT3, iter: true, callback: .Args(func_range) },
+        "min": fun(ARGCOUNT0, .Arg0(func_min)),
+        "_min_by": fun(ARGCOUNT1, .Arg1(func_min_by)),
+        "max": fun(ARGCOUNT0, .Arg0(func_max)),
+        "_max_by": fun(ARGCOUNT1, .Arg1(func_max_by)),
+        "sort": fun(ARGCOUNT0, .Arg0(func_sort)),
+        "_sort_by": fun(ARGCOUNT1, .Arg1(func_sort_by)),
+        "_group_by": fun(ARGCOUNT1, .Arg1(func_group_by)),
+        "unique": fun(ARGCOUNT0, .Arg0(func_unique)),
+        "_unique_by": fun(ARGCOUNT1, .Arg1(func_unique_by)),
+        "sin": fun(ARGCOUNT0, .Math1("sin", go_sin)),
+        "cos": fun(ARGCOUNT0, .Math1("cos", go_cos)),
+        "tan": fun(ARGCOUNT0, .Math1("tan", go_tan)),
+        "asin": fun(ARGCOUNT0, .Math1("asin", go_asin)),
+        "acos": fun(ARGCOUNT0, .Math1("acos", go_acos)),
+        "atan": fun(ARGCOUNT0, .Math1("atan", go_atan)),
+        "sinh": fun(ARGCOUNT0, .Math1("sinh", gomath.sinh)),
+        "cosh": fun(ARGCOUNT0, .Math1("cosh", gomath.cosh)),
+        "tanh": fun(ARGCOUNT0, .Math1("tanh", gomath.tanh)),
+        "asinh": fun(ARGCOUNT0, .Math1("asinh", gomath.asinh)),
+        "acosh": fun(ARGCOUNT0, .Math1("acosh", gomath.acosh)),
+        "atanh": fun(ARGCOUNT0, .Math1("atanh", gomath.atanh)),
+        "floor": fun(ARGCOUNT0, .Math1("floor", go_floor)),
+        "round": fun(ARGCOUNT0, .Math1("round", math.round)),
+        "nearbyint": fun(ARGCOUNT0, .Math1("nearbyint", go_round_to_even)),
+        "rint": fun(ARGCOUNT0, .Math1("rint", go_round_to_even)),
+        "ceil": fun(ARGCOUNT0, .Math1("ceil", go_ceil)),
+        "trunc": fun(ARGCOUNT0, .Math1("trunc", go_trunc)),
+        "significand": fun(ARGCOUNT0, .Math1("significand", func_significand)),
+        "fabs": fun(ARGCOUNT0, .Math1("fabs", go_abs)),
+        "sqrt": fun(ARGCOUNT0, .Math1("sqrt", go_sqrt)),
+        "cbrt": fun(ARGCOUNT0, .Math1("cbrt", gomath.cbrt)),
+        "exp": fun(ARGCOUNT0, .Math1("exp", go_exp)),
+        "exp10": fun(ARGCOUNT0, .Math1("exp10", func_exp10)),
+        "exp2": fun(ARGCOUNT0, .Math1("exp2", go_exp2)),
+        "expm1": fun(ARGCOUNT0, .Math1("expm1", gomath.expm1)),
+        "frexp": fun(ARGCOUNT0, .Arg0(func_frexp)),
+        "modf": fun(ARGCOUNT0, .Arg0(func_modf)),
+        "log": fun(ARGCOUNT0, .Math1("log", go_log)),
+        "log10": fun(ARGCOUNT0, .Math1("log10", go_log10)),
+        "log1p": fun(ARGCOUNT0, .Math1("log1p", gomath.log1p)),
+        "log2": fun(ARGCOUNT0, .Math1("log2", go_log2)),
+        "logb": fun(ARGCOUNT0, .Math1("logb", gomath.logb)),
+        "gamma": fun(ARGCOUNT0, .Math1("gamma", gomath.gamma)),
+        "tgamma": fun(ARGCOUNT0, .Math1("tgamma", gomath.gamma)),
+        "lgamma": fun(ARGCOUNT0, .Math1("lgamma", func_lgamma)),
+        "erf": fun(ARGCOUNT0, .Math1("erf", gomath.erf)),
+        "erfc": fun(ARGCOUNT0, .Math1("erfc", gomath.erfc)),
+        "j0": fun(ARGCOUNT0, .Math1("j0", gomath.j0)),
+        "j1": fun(ARGCOUNT0, .Math1("j1", gomath.j1)),
+        "y0": fun(ARGCOUNT0, .Math1("y0", gomath.y0)),
+        "y1": fun(ARGCOUNT0, .Math1("y1", gomath.y1)),
+        "atan2": fun(ARGCOUNT2, .Math2("atan2", go_atan2)),
+        "copysign": fun(ARGCOUNT2, .Math2("copysign", go_copysign)),
+        "drem": fun(ARGCOUNT2, .Math2("drem", func_drem)),
+        "fdim": fun(ARGCOUNT2, .Math2("fdim", math.dim)),
+        "fmax": fun(ARGCOUNT2, .Math2("fmax", func_fmax)),
+        "fmin": fun(ARGCOUNT2, .Math2("fmin", func_fmin)),
+        "fmod": fun(ARGCOUNT2, .Math2("fmod", gomath.mod)),
+        "hypot": fun(ARGCOUNT2, .Math2("hypot", gomath.hypot)),
+        "jn": fun(ARGCOUNT2, .Math2("jn", func_jn)),
+        "nextafter": fun(ARGCOUNT2, .Math2("nextafter", gomath.nextafter)),
+        "nexttoward": fun(ARGCOUNT2, .Math2("nexttoward", gomath.nextafter)),
+        "remainder": fun(ARGCOUNT2, .Math2("remainder", gomath.remainder)),
+        "ldexp": fun(ARGCOUNT2, .Math2("ldexp", func_ldexp)),
+        "scalb": fun(ARGCOUNT2, .Math2("scalb", func_ldexp)),
+        "scalbln": fun(ARGCOUNT2, .Math2("scalbln", func_ldexp)),
+        "yn": fun(ARGCOUNT2, .Math2("yn", func_yn)),
+        "pow": fun(ARGCOUNT2, .Math2("pow", gomath.pow)),
+        "fma": Function { argcount: ARGCOUNT3, iter: false, callback: .Math3("fma", gomath.fma) },
+        "infinite": fun(ARGCOUNT0, .Arg0(func_infinite)),
+        "isfinite": fun(ARGCOUNT0, .Arg0(func_isfinite)),
+        "isinfinite": fun(ARGCOUNT0, .Arg0(func_isinfinite)),
+        "nan": fun(ARGCOUNT0, .Arg0(func_nan)),
+        "isnan": fun(ARGCOUNT0, .Arg0(func_isnan)),
+        "isnormal": fun(ARGCOUNT0, .Arg0(func_isnormal)),
+        "setpath": fun(ARGCOUNT2, .Arg2(func_setpath)),
+        "delpaths": fun(ARGCOUNT1, .Arg1(func_delpaths)),
+        "getpath": fun(ARGCOUNT1, .Arg1(func_getpath)),
+        "transpose": fun(ARGCOUNT0, .Arg0(func_transpose)),
+        "bsearch": fun(ARGCOUNT1, .Arg1(func_bsearch)),
+        "gmtime": fun(ARGCOUNT0, .Arg0(func_gmtime)),
+        "localtime": local(ARGCOUNT0, "localtime"),
+        "mktime": fun(ARGCOUNT0, .Arg0(func_mktime)),
+        "strftime": fun(ARGCOUNT1, .Arg1(func_strftime)),
+        "strflocaltime": local(ARGCOUNT1, "strflocaltime"),
+        "strptime": local(ARGCOUNT1, "strptime"),
+        "now": local(ARGCOUNT0, "now"),
+        "_match": Function { argcount: ARGCOUNT3, iter: false, callback: .Nil },
+        "_captures": fun(ARGCOUNT0, .Arg0(func_captures)),
+        "error": Function { argcount: ARGCOUNT0 | ARGCOUNT1, iter: false, callback: .Args(func_error) },
+        "halt": fun(ARGCOUNT0, .Arg0(func_halt)),
+        "halt_error": Function { argcount: ARGCOUNT0 | ARGCOUNT1, iter: false, callback: .Args(func_halt_error) },
+    }
+
+## Calls the callback of a mathFuncN closure.
+pub fn call_math1(name: string, f: fn(f64) -> f64, v: Value) -> Item:
+    match to_float64(v):
+        .Some(x) => .V(.Float(f(x)))
+        .None => .Err(.Func0Type(name, v))
+
+pub fn call_math2(name: string, f: fn(f64, f64) -> f64, x: Value, y: Value) -> Item:
+    let .Some(l) = to_float64(x) else: return .Err(.Func0Type(name, x))
+    let .Some(r) = to_float64(y) else: return .Err(.Func0Type(name, y))
+    .V(.Float(f(l, r)))
+
+pub fn call_math3(name: string, f: fn(f64, f64, f64) -> f64, a: Value, b: Value, c: Value) -> Item:
+    let .Some(x) = to_float64(a) else: return .Err(.Func0Type(name, a))
+    let .Some(y) = to_float64(b) else: return .Err(.Func0Type(name, b))
+    let .Some(z) = to_float64(c) else: return .Err(.Func0Type(name, c))
+    .V(.Float(f(x, y, z)))
+
+fn res(r: Result[Value, JqError]) -> Item:
+    match r:
+        .Ok(v) => .V(v)
+        .Err(e) => .Err(e)
+
+fn func_op_plus_item(v: Value) -> Item: res(func_op_plus(v))
+fn func_op_negate_item(v: Value) -> Item: res(func_op_negate(v))
+fn op_add(_unused: Value, l: Value, r: Value) -> Item: res(func_op_add(l, r))
+fn op_sub(_unused: Value, l: Value, r: Value) -> Item: res(func_op_sub(l, r))
+fn op_mul(_unused: Value, l: Value, r: Value) -> Item: res(func_op_mul(l, r))
+fn op_div(_unused: Value, l: Value, r: Value) -> Item: res(func_op_div(l, r))
+fn op_mod(_unused: Value, l: Value, r: Value) -> Item: res(func_op_mod(l, r))
+fn op_alt(_unused: Value, l: Value, r: Value) -> Item: res(func_op_alt(l, r))
+fn op_eq(_unused: Value, l: Value, r: Value) -> Item: res(func_op_eq(l, r))
+fn op_ne(_unused: Value, l: Value, r: Value) -> Item: res(func_op_ne(l, r))
+fn op_gt(_unused: Value, l: Value, r: Value) -> Item: res(func_op_gt(l, r))
+fn op_lt(_unused: Value, l: Value, r: Value) -> Item: res(func_op_lt(l, r))
+fn op_ge(_unused: Value, l: Value, r: Value) -> Item: res(func_op_ge(l, r))
+fn op_le(_unused: Value, l: Value, r: Value) -> Item: res(func_op_le(l, r))
+
+# Go's math functions: the exact IEEE operations from hd's f64, the
+# others ported from Go (hd's sin, exp, log... differ from Go in the last bit).
+fn go_sin(x: f64) -> f64: gomath.sin(x)
+fn go_cos(x: f64) -> f64: gomath.cos(x)
+fn go_tan(x: f64) -> f64: gomath.tan(x)
+fn go_asin(x: f64) -> f64: gomath.asin(x)
+fn go_acos(x: f64) -> f64: gomath.acos(x)
+fn go_atan(x: f64) -> f64: gomath.atan(x)
+fn go_floor(x: f64) -> f64: x.floor()
+fn go_ceil(x: f64) -> f64: x.ceil()
+fn go_trunc(x: f64) -> f64: x.trunc()
+fn go_round_to_even(x: f64) -> f64: x.round_ties_even()
+fn go_abs(x: f64) -> f64: x.abs()
+fn go_sqrt(x: f64) -> f64: x.sqrt()
+fn go_exp(x: f64) -> f64: gomath.exp(x)
+fn go_exp2(x: f64) -> f64: gomath.exp2(x)
+fn go_log(x: f64) -> f64: gomath.log(x)
+fn go_log10(x: f64) -> f64: gomath.log10(x)
+fn go_log2(x: f64) -> f64: gomath.log2(x)
+fn go_atan2(y: f64, x: f64) -> f64: gomath.atan2(y, x)
+fn go_copysign(x: f64, y: f64) -> f64: x.copysign(y)
+
+# ---------------------------------------------------------------- basics
+
+fn negate_int(v: i64) -> Value:
+    if v == -9223372036854775807 - 1:
+        return .Big(bigint.negate(bigint.from_i64(v)))
+    .Int(-v)
+
+fn func_length(v: Value) -> Item:
+    match v:
+        .Null => .V(.Int(0))
+        .Int(i) => .V(if i >= 0: v else: negate_int(i))
+        .Float(f) => .V(.Float(f.abs()))
+        .Big(b) => .V(if !b.neg: v else: .Big(bigint.abs(b)))
+        .Number(s) =>
+            if !s.starts_with("-"):
+                return .V(v)
+            .V(.Number(s.slice(1, s.len())))
+        .Str(s) => .V(.Int(i64(s.chars().count())))
+        .Arr(a) => .V(.Int(i64(a.items.len())))
+        .Obj(m) => .V(.Int(i64(m.fields.len())))
+        _ => .Err(.Func0Type("length", v))
+
+fn func_utf8_byte_length(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("utf8bytelength", v))
+    .V(.Int(i64(go_bytes(s).len())))
+
+fn func_keys(v: Value) -> Item:
+    match v:
+        .Arr(a) => .V(arr([for i in 0..a.items.len() => Value.Int(i64(i))]))
+        .Obj(m) => .V(arr([for k in sorted_keys(m.fields) => Value.Str(k)]))
+        _ => .Err(.Func0Type("keys", v))
+
+## values: the elements of an array, or the values of an object by key order.
+fn values(v: Value) -> (List[Value])?:
+    match v:
+        .Arr(a) => .Some(a.items)
+        .Obj(m) => .Some([for k in sorted_keys(m.fields) => m.fields[k]])
+        _ => .None
+
+fn func_has(v: Value, x: Value) -> Item:
+    match v:
+        .Arr(a) =>
+            match to_int(x):
+                .Some(i) => return .V(.Bool(0 <= i && i < i64(a.items.len())))
+                .None => pass
+        .Obj(m) =>
+            match x:
+                .Str(k) => return .V(.Bool(m.fields.contains_key(k)))
+                _ => pass
+        .Null => return .V(.Bool(false))
+        _ => pass
+    .Err(.Func1Type("has", v, x))
+
+fn func_add(v: Value) -> Item:
+    let .Some(vs) = values(v) else: return .Err(.Func0Type("add", v))
+    add(vs)
+
+# The kinds of value `add` accumulates in place.
+ACC_NIL := 0i64
+ACC_STR := 1i64
+ACC_ARR := 2i64
+ACC_OBJ := 3i64
+ACC_VAL := 4i64
+
+fn add(xs: List[Value]) -> Item:
+    let kind = ACC_NIL
+    sb := StringBuilder::new()
+    let mut items: List[Value] = []
+    let mut fields: Map[string, Value] = {}
+    let v: Value = .Null
+    for x in xs:
+        match x:
+            .Null => continue
+            .Str(s) =>
+                if kind == ACC_NIL:
+                    sb.push(s)
+                    kind = ACC_STR
+                    continue
+                if kind == ACC_STR:
+                    sb.push(s)
+                    continue
+            .Arr(a) =>
+                if kind == ACC_NIL:
+                    items = a.items
+                    kind = ACC_ARR
+                    continue
+                if kind == ACC_ARR:
+                    items.extend(a.items)
+                    continue
+            .Obj(m) =>
+                if kind == ACC_NIL:
+                    fields = m.fields
+                    kind = ACC_OBJ
+                    continue
+                if kind == ACC_OBJ:
+                    for (k, w) in m.fields:
+                        fields[*k] = *w
+                    continue
+            _ => pass
+        cur := acc_value(kind, sb, items, fields, v)
+        match func_op_add(cur, x):
+            .Ok(w) =>
+                v = w
+                kind = ACC_VAL
+            .Err(e) => return .Err(e)
+    .V(acc_value(kind, sb, items, fields, v))
+
+fn acc_value(kind: i64, sb: *mut StringBuilder, items: List[Value], fields: Map[string, Value], v: Value) -> Value:
+    if kind == ACC_STR:
+        return .Str(sb.build())
+    if kind == ACC_ARR:
+        return arr(items)
+    if kind == ACC_OBJ:
+        return obj(fields)
+    v
+
+fn func_to_boolean(v: Value) -> Item:
+    match v:
+        .Bool(_) => .V(v)
+        .Str(s) =>
+            match s:
+                "true" => .V(.Bool(true))
+                "false" => .V(.Bool(false))
+                _ => .Err(.Func0Wrap("toboolean", v, box(JqError.Message("invalid boolean"))))
+        _ => .Err(.Func0Type("toboolean", v))
+
+fn func_to_number(v: Value) -> Item:
+    match v:
+        .Int(_) => .V(v)
+        .Float(_) => .V(v)
+        .Big(_) => .V(v)
+        .Number(_) => .V(v)
+        .Str(s) =>
+            if !new_lexer(s).valid_number():
+                return .Err(.Func0Wrap("tonumber", v, box(JqError.Message("invalid number"))))
+            .V(to_number(s))
+        _ => .Err(.Func0Type("tonumber", v))
+
+fn func_to_string(v: Value) -> Item:
+    .V(.Str(to_string(v)))
+
+pub fn to_string(v: Value) -> string:
+    match v:
+        .Str(s) => s
+        .Int(i) => "$i"
+        .Big(b) => bigint.to_string(b)
+        .Number(s) => s
+        _ => json_marshal(v)
+
+fn func_type(v: Value) -> Item:
+    .V(.Str(type_of(v)))
+
+fn func_reverse(v: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func0Type("reverse", v))
+    n := a.items.len()
+    .V(arr([for i in 0..n => a.items[n - i - 1]]))
+
+fn contains(v: Value, x: Value) -> Item:
+    match binop_type_switch(v, x):
+        .Ints(l, r) => .V(.Bool(l == r))
+        .Floats(l, r) => .V(.Bool(l == r))
+        .BigInts(l, r) => .V(.Bool(bigint.compare(l, r) == 0))
+        .Strings(l, r) => .V(.Bool(l.contains(r)))
+        .Arrays(l, r) =>
+            for y in r.items:
+                let found = false
+                for w in l.items:
+                    if is_true(contains(w, y)):
+                        found = true
+                        break
+                if !found:
+                    return .V(.Bool(false))
+            .V(.Bool(true))
+        .Maps(l, r) =>
+            if l.fields.len() < r.fields.len():
+                return .V(.Bool(false))
+            for (k, y) in r.fields:
+                match l.fields.get(*k):
+                    .Some(w) =>
+                        if !is_true(contains(w, *y)):
+                            return .V(.Bool(false))
+                    .None => return .V(.Bool(false))
+            .V(.Bool(true))
+        .Fallback(l, r) =>
+            if same(l, r):
+                return .V(.Bool(true))
+            .Err(.Func1Type("contains", l, r))
+
+fn is_true(x: Item) -> bool:
+    match x:
+        .V(.Bool(b)) => b
+        _ => false
+
+fn func_contains(v: Value, x: Value) -> Item:
+    contains(v, x)
+
+fn func_inside(v: Value, x: Value) -> Item:
+    contains(x, v)
+
+# The searches of indexFunc.
+SEARCH_INDICES := 0i64
+SEARCH_INDEX := 1i64
+SEARCH_RINDEX := 2i64
+
+fn func_indices(v: Value, x: Value) -> Item:
+    index_func("indices", v, x, SEARCH_INDICES)
+
+fn indices(vs: List[Value], xs: List[Value]) -> Value:
+    let mut rs: List[Value] = []
+    if xs.is_empty() || xs.len() > vs.len():
+        return arr(rs)
+    for i in 0..(vs.len() - xs.len() + 1):
+        if compare_slices(vs, i, xs) == 0:
+            rs.push(.Int(i64(i)))
+    arr(rs)
+
+## Compare(vs[i:i+len(xs)], xs)
+fn compare_slices(vs: List[Value], i: usize, xs: List[Value]) -> i32:
+    for (j, x) in xs.iter().enumerate():
+        c := compare(vs[i + j], x)
+        if c != 0:
+            return c
+    0
+
+fn func_index(v: Value, x: Value) -> Item:
+    index_func("index", v, x, SEARCH_INDEX)
+
+fn func_rindex(v: Value, x: Value) -> Item:
+    index_func("rindex", v, x, SEARCH_RINDEX)
+
+fn search(vs: List[Value], xs: List[Value], kind: i64) -> Value:
+    if kind == SEARCH_INDICES:
+        return indices(vs, xs)
+    if xs.is_empty() || xs.len() > vs.len():
+        return .Null
+    n := vs.len() - xs.len() + 1
+    if kind == SEARCH_INDEX:
+        for i in 0..n:
+            if compare_slices(vs, i, xs) == 0:
+                return .Int(i64(i))
+        return .Null
+    let i = n
+    while i > 0:
+        i -= 1
+        if compare_slices(vs, i, xs) == 0:
+            return .Int(i64(i))
+    .Null
+
+fn index_func(name: string, v: Value, x: Value, kind: i64) -> Item:
+    match v:
+        .Null => .V(.Null)
+        .Arr(a) =>
+            match x:
+                .Arr(b) => .V(search(a.items, b.items, kind))
+                _ => .V(search(a.items, [x], kind))
+        .Str(s) =>
+            match x:
+                .Str(t) => .V(search(explode(s), explode(t), kind))
+                _ => .Err(.Func1Type(name, v, x))
+        _ => .Err(.Func1Type(name, v, x))
+
+fn string_args(name: string, v: Value, x: Value) -> Result[(string, string), JqError]:
+    let .Str(s) = v else: return .Err(.Func1Type(name, v, x))
+    let .Str(t) = x else: return .Err(.Func1Type(name, v, x))
+    .Ok((s, t))
+
+fn func_starts_with(v: Value, x: Value) -> Item:
+    match string_args("startswith", v, x):
+        .Ok((s, t)) => .V(.Bool(s.starts_with(t)))
+        .Err(e) => .Err(e)
+
+fn func_ends_with(v: Value, x: Value) -> Item:
+    match string_args("endswith", v, x):
+        .Ok((s, t)) => .V(.Bool(s.ends_with(t)))
+        .Err(e) => .Err(e)
+
+fn trim_prefix(s: string, t: string) -> string:
+    s.strip_prefix(t).unwrap_or(s)
+
+fn trim_suffix(s: string, t: string) -> string:
+    s.strip_suffix(t).unwrap_or(s)
+
+fn func_ltrimstr(v: Value, x: Value) -> Item:
+    match string_args("ltrimstr", v, x):
+        .Ok((s, t)) => .V(.Str(trim_prefix(s, t)))
+        .Err(e) => .Err(e)
+
+fn func_rtrimstr(v: Value, x: Value) -> Item:
+    match string_args("rtrimstr", v, x):
+        .Ok((s, t)) => .V(.Str(trim_suffix(s, t)))
+        .Err(e) => .Err(e)
+
+fn func_trimstr(v: Value, x: Value) -> Item:
+    match string_args("trimstr", v, x):
+        .Ok((s, t)) => .V(.Str(trim_suffix(trim_prefix(s, t), t)))
+        .Err(e) => .Err(e)
+
+fn func_ltrim(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("ltrim", v))
+    .V(.Str(trim_left_space(s)))
+
+fn func_rtrim(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("rtrim", v))
+    .V(.Str(trim_right_space(s)))
+
+fn func_trim(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("trim", v))
+    .V(.Str(trim_space(s)))
+
+fn func_explode(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("explode", v))
+    .V(arr(explode(s)))
+
+## an invalid byte reads as U+FFFD, as Go's range over a string decodes it
+fn explode(s: string) -> List[Value]:
+    [for c in s.chars() => Value.Int(rune_of(c))]
+
+fn rune_of(c: char) -> i64:
+    match marker_byte(c):
+        .Some(_) => 65533
+        .None => i64(c.to_u32())
+
+fn func_implode(v: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func0Type("implode", v))
+    sb := StringBuilder::new()
+    for x in a.items:
+        match to_int(x):
+            .Some(r) =>
+                if 0 <= r && r <= 0x10FFFF:
+                    sb.push_char(char::try_from(u32(r)).unwrap_or('\u{FFFD}'))
+                else:
+                    sb.push_char('\u{FFFD}')
+            .None => return .Err(.Func0Type("implode", v))
+    .V(.Str(sb.build()))
+
+fn func_split(v: Value, x: Value) -> Item:
+    match string_args("split", v, x):
+        .Ok((s, t)) => .V(split_string(s, t))
+        .Err(e) => .Err(e)
+
+pub fn split_string(s: string, t: string) -> Value:
+    if s.is_empty():
+        return arr([])
+    if t.is_empty():
+        # strings.Split with an empty separator splits after each UTF-8 sequence
+        return arr([for c in s.chars() => Value.Str(c.to_string())])
+    arr([for x in s.split(t) => Value.Str(x)])
+
+fn func_join(v: Value, x: Value) -> Item:
+    let .Some(vs) = values(v) else: return .Err(.Func1Type("join", v, x))
+    if vs.is_empty():
+        return .V(.Str(""))
+    let mut xs: List[Value] = []
+    for (i, w) in vs.iter().enumerate():
+        xs.push(if i == 0: Value.Str("") else: x)
+        match w:
+            .Bool(_) => xs.push(.Str(json_marshal(w)))
+            .Int(_) => xs.push(.Str(json_marshal(w)))
+            .Float(_) => xs.push(.Str(json_marshal(w)))
+            .Big(_) => xs.push(.Str(json_marshal(w)))
+            .Number(_) => xs.push(.Str(json_marshal(w)))
+            _ => xs.push(w)
+    add(xs)
+
+## strings.Map: invalid bytes come out as U+FFFD
+fn map_ascii(s: string, lower: bool) -> string:
+    let mut bs: List[u8] = display(s).bytes().collect()
+    for i in 0..bs.len():
+        b := bs[i]
+        if lower && b >= 0x41 && b <= 0x5a:
+            bs[i] = b + 0x20
+        else if !lower && b >= 0x61 && b <= 0x7a:
+            bs[i] = b - 0x20
+    lossy(bs)
+
+fn func_ascii_downcase(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("ascii_downcase", v))
+    .V(.Str(map_ascii(s, true)))
+
+fn func_ascii_upcase(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("ascii_upcase", v))
+    .V(.Str(map_ascii(s, false)))
+
+fn func_to_json(v: Value) -> Item:
+    .V(.Str(json_marshal(v)))
+
+fn json_error(e: JsonErr) -> JqError:
+    match e:
+        .Syntax(msg, off) => .JsonSyntax(msg, off)
+        .UnexpectedEOF => .UnexpectedEOF
+
+fn func_from_json(v: Value) -> Item:
+    let .Str(s) = v else: return .Err(.Func0Type("fromjson", v))
+    dec := new_decoder(s)
+    let w = match dec.decode():
+        .Ok(.Some(x)) => x
+        .Ok(.None) => return .Err(.Func0Wrap("fromjson", v, box(JqError.Message("EOF"))))
+        .Err(e) => return .Err(.Func0Wrap("fromjson", v, box(json_error(e))))
+    match dec.token():
+        .Ok(.None) => .V(w)
+        _ => .Err(.Func0Type("fromjson", v))
+
+fn func_format(v: Value, x: Value) -> Item:
+    let .Str(s) = x else: return .Err(.Func0Type("format", x))
+    format := "@" + s
+    match format:
+        "@text" => func_to_string(v)
+        "@json" => func_to_json(v)
+        "@html" => func_to_html(v)
+        "@uri" => func_to_uri(v)
+        "@urid" => func_to_urid(v)
+        "@csv" => func_to_csv(v)
+        "@tsv" => func_to_tsv(v)
+        "@sh" => func_to_sh(v)
+        "@base64" => func_to_base64(v)
+        "@base64d" => func_to_base64d(v)
+        _ => .Err(.FormatNotFound(format))
+
+fn func_to_html(v: Value) -> Item:
+    .V(.Str(replace_bytes(to_string(v), [(0x3c, "&lt;"), (0x3e, "&gt;"), (0x26, "&amp;"), (0x27, "&apos;"), (0x22, "&quot;")])))
+
+fn func_to_uri(v: Value) -> Item:
+    .V(.Str(query_escape(to_string(v)).replace("+", "%20")))
+
+fn func_to_urid(v: Value) -> Item:
+    match query_unescape(to_string(v).replace("+", "%2B")):
+        .Ok(x) => .V(.Str(x))
+        .Err(e) => .Err(.Func0Wrap("@urid", v, box(JqError.Message(e))))
+
+fn csv_escape(s: string) -> string:
+    "\"" + replace_bytes(s, [(0x22, "\"\""), (0x00, "\\0")]) + "\""
+
+fn tsv_escape(s: string) -> string:
+    replace_bytes(s, [(0x09, "\\t"), (0x0d, "\\r"), (0x0a, "\\n"), (0x5c, "\\\\"), (0x00, "\\0")])
+
+fn sh_escape(s: string) -> string:
+    "'" + replace_bytes(s, [(0x27, "'\\''"), (0x00, "\\0")]) + "'"
+
+fn func_to_csv(v: Value) -> Item:
+    format_join("csv", v, ",", csv_escape)
+
+fn func_to_tsv(v: Value) -> Item:
+    format_join("tsv", v, "\t", tsv_escape)
+
+fn func_to_sh(v: Value) -> Item:
+    match v:
+        .Arr(_) => format_join("sh", v, " ", sh_escape)
+        _ => format_join("sh", arr([v]), " ", sh_escape)
+
+fn format_join(typ: string, v: Value, sep: string, escape: fn(string) -> string) -> Item:
+    let .Arr(a) = v else: return .Err(.Func0Type("@" + typ, v))
+    let mut ss: List[string] = []
+    for x in a.items:
+        match x:
+            .Arr(_) => return .Err(.FormatRow(typ, x))
+            .Obj(_) => return .Err(.FormatRow(typ, x))
+            .Str(s) => ss.push(escape(s))
+            _ =>
+                s := json_marshal(x)
+                ss.push(if s != "null" || typ == "sh": s else: "")
+    .V(.Str(ss.join(sep)))
+
+fn func_to_base64(v: Value) -> Item:
+    .V(.Str(base64_encode(go_bytes(to_string(v)))))
+
+fn func_to_base64d(v: Value) -> Item:
+    let x = to_string(v)
+    match x.find("="):
+        .Some(i) => x = x.slice(0, i)
+        .None => pass
+    match base64_raw_decode(x):
+        .Ok(y) => .V(.Str(lossy(y)))
+        .Err(e) => .Err(.Func0Wrap("@base64d", v, box(JqError.Message(e))))
+
+# ---------------------------------------------------------------- indexing
+
+## funcIndex2(_, v, x); also used by the VM's opindex.
+pub fn func_index2(_unused: Value, v: Value, x: Value) -> Item:
+    match x:
+        .Str(k) =>
+            match v:
+                .Null => .V(.Null)
+                .Obj(m) => .V(m.fields.get(k).unwrap_or(Value.Null))
+                _ => .Err(.ExpectedObject(v))
+        .Int(_) => index_number(v, x)
+        .Float(_) => index_number(v, x)
+        .Big(_) => index_number(v, x)
+        .Number(_) => index_number(v, x)
+        .Arr(xs) =>
+            match v:
+                .Null => .V(.Null)
+                .Arr(vs) => .V(indices(vs.items, xs.items))
+                _ => .Err(.ExpectedArray(v))
+        .Obj(m) =>
+            match v:
+                .Null => return .V(.Null)
+                _ => pass
+            let .Some(start) = m.fields.get("start") else: return .Err(.ExpectedStartEnd(x))
+            let .Some(end) = m.fields.get("end") else: return .Err(.ExpectedStartEnd(x))
+            func_slice(.Null, v, end, start)
+        _ =>
+            match v:
+                .Arr(_) => .Err(.ArrayIndexNotNumber(x))
+                .Str(_) => .Err(.StringIndexNotNumber(x))
+                _ => .Err(.ObjectKeyNotString(x))
+
+fn index_number(v: Value, x: Value) -> Item:
+    i := to_int(x).unwrap_or(0)
+    match v:
+        .Null => .V(.Null)
+        .Arr(a) => .V(index(a.items, i))
+        .Str(s) => .V(index_string(s, i))
+        _ => .Err(.ExpectedArray(v))
+
+fn index(vs: List[Value], i0: i64) -> Value:
+    i := clamp_index(i0, -1, i64(vs.len()))
+    if 0 <= i && i < i64(vs.len()):
+        return vs[usize(i)]
+    .Null
+
+fn index_string(s: string, i0: i64) -> Value:
+    l := i64(s.chars().count())
+    let i = clamp_index(i0, -1, l)
+    if 0 <= i && i < l:
+        for c in s.chars():
+            i -= 1
+            if i < 0:
+                return .Str(c.to_string())
+    .Null
+
+fn func_slice(_unused: Value, v: Value, e: Value, s: Value) -> Item:
+    match v:
+        .Null => .V(.Null)
+        .Arr(a) => slice(a, e, s)
+        .Str(str) => slice_string(str, e, s)
+        _ => .Err(.ExpectedArray(v))
+
+fn slice(a: *mut ArrBox, e: Value, s: Value) -> Item:
+    vs := a.items
+    l := i64(vs.len())
+    let start = 0i64
+    let end = 0i64
+    match s:
+        .Null => pass
+        _ =>
+            match to_int_floor(s):
+                .Some(i) => start = clamp_index(i, 0, l)
+                .None => return .Err(.ArrayIndexNotNumber(s))
+    match e:
+        .Null => end = l
+        _ =>
+            match to_int_ceil(e):
+                .Some(i) => end = clamp_index(i, start, l)
+                .None => return .Err(.ArrayIndexNotNumber(e))
+    # vs[0:len(vs)] keeps the address and length of vs, as path tracking sees it
+    if start == 0 && end == l:
+        return .V(.Arr(a))
+    .V(arr(vs.slice(usize(start), usize(end))))
+
+fn slice_string(v: string, e: Value, s: Value) -> Item:
+    l := i64(v.chars().count())
+    let start = 0i64
+    let end = 0i64
+    match s:
+        .Null => pass
+        _ =>
+            match to_int_floor(s):
+                .Some(i) => start = clamp_index(i, 0, l)
+                .None => return .Err(.StringIndexNotNumber(s))
+    match e:
+        .Null => end = l
+        _ =>
+            match to_int_ceil(e):
+                .Some(i) => end = clamp_index(i, start, l)
+                .None => return .Err(.StringIndexNotNumber(e))
+    .V(.Str(v.slice(byte_offset(v, start, l), byte_offset(v, end, l))))
+
+## The byte offset of the code point at index i (i <= l).
+fn byte_offset(v: string, i: i64, l: i64) -> usize:
+    if i >= l:
+        return v.len()
+    let n = i
+    for (b, _) in v.char_indices():
+        n -= 1
+        if n < 0:
+            return b
+    v.len()
+
+fn clamp_index(i0: i64, minimum: i64, maximum: i64) -> i64:
+    let i = i0
+    if i < 0:
+        i += maximum
+    if i < minimum:
+        return minimum
+    if i < maximum:
+        return i
+    maximum
+
+fn func_flatten(v: Value, args: List[Value]) -> Item:
+    let .Some(vs) = values(v) else: return .Err(.Func0Type("flatten", v))
+    let depth = -1.0
+    if !args.is_empty():
+        match to_float64(args[0]):
+            .Some(d) => depth = d
+            .None => return .Err(.Func0Type("flatten", args[0]))
+        if lt(depth, 0.0):
+            return .Err(.FlattenDepth(depth))
+    let mut xs: List[Value] = []
+    flatten(&mut xs, vs, depth)
+    .V(arr(xs))
+
+fn flatten(xs: &mut List[Value], vs: List[Value], depth: f64) -> void:
+    for v in vs:
+        match v:
+            .Arr(a) =>
+                if depth != 0.0:
+                    flatten(xs, a.items, depth - 1.0)
+                else:
+                    xs.push(v)
+            _ => xs.push(v)
+
+struct RangeIter:
+    value: Value
+    end: Value
+    step: Value
+
+impl Iter for RangeIter:
+    fn next(&mut self) -> Item?:
+        if compare(self.step, .Int(0)) * compare(self.value, self.end) >= 0:
+            return .None
+        v := self.value
+        match func_op_add(v, self.step):
+            .Ok(w) => self.value = w
+            .Err(_) => self.value = .Null
+        .Some(.V(v))
+
+fn func_range(_unused: Value, xs: List[Value]) -> Item:
+    for x in xs:
+        match x:
+            .Int(_) => pass
+            .Float(_) => pass
+            .Big(_) => pass
+            .Number(_) => pass
+            _ => return .Err(.Func0Type("range", x))
+    .It(box(RangeIter { value: xs[0], end: xs[1], step: xs[2] }))
+
+fn func_min(v: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func0Type("min", v))
+    .V(min_max_by(a.items, a.items, true))
+
+fn func_min_by(v: Value, x: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func1Type("min_by", v, x))
+    let .Arr(b) = x else: return .Err(.Func1Type("min_by", v, x))
+    if a.items.len() != b.items.len():
+        return .Err(.Func1Wrap("min_by", v, x, box(JqError.LengthMismatch)))
+    .V(min_max_by(a.items, b.items, true))
+
+fn func_max(v: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func0Type("max", v))
+    .V(min_max_by(a.items, a.items, false))
+
+fn func_max_by(v: Value, x: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func1Type("max_by", v, x))
+    let .Arr(b) = x else: return .Err(.Func1Type("max_by", v, x))
+    if a.items.len() != b.items.len():
+        return .Err(.Func1Wrap("max_by", v, x, box(JqError.LengthMismatch)))
+    .V(min_max_by(a.items, b.items, false))
+
+fn min_max_by(vs: List[Value], xs: List[Value], is_min: bool) -> Value:
+    if vs.is_empty():
+        return .Null
+    let j = 0usize
+    let x = xs[0]
+    for i in 1..xs.len():
+        if (compare(x, xs[i]) > 0) == is_min:
+            j = i
+            x = xs[i]
+    vs[j]
+
+struct SortItem:
+    value: Value
+    key: Value
+
+fn sort_items(name: string, v: Value, x: Value) -> Result[List[SortItem], JqError]:
+    let .Arr(a) = v else:
+        if name.ends_with("_by"):
+            return .Err(.Func1Type(name, v, x))
+        return .Err(.Func0Type(name, v))
+    let .Arr(b) = x else: return .Err(.Func1Type(name, v, x))
+    if a.items.len() != b.items.len():
+        return .Err(.Func1Wrap(name, v, x, box(JqError.LengthMismatch)))
+    let mut items = [for (i, w) in a.items.iter().enumerate() => SortItem { value: w, key: b.items[i] }]
+    items.sort_by(fn(p, q): compare_ordering(compare(p.key, q.key)))
+    .Ok(items)
+
+fn compare_ordering(c: i32) -> Ordering:
+    if c < 0: Ordering.Less else if c > 0: Ordering.Greater else: Ordering.Equal
+
+fn func_sort(v: Value) -> Item:
+    sort_by("sort", v, v)
+
+fn func_sort_by(v: Value, x: Value) -> Item:
+    sort_by("sort_by", v, x)
+
+fn sort_by(name: string, v: Value, x: Value) -> Item:
+    match sort_items(name, v, x):
+        .Ok(items) => .V(arr([for it in items => it.value]))
+        .Err(e) => .Err(e)
+
+fn func_group_by(v: Value, x: Value) -> Item:
+    let items = match sort_items("group_by", v, x):
+        .Ok(xs) => xs
+        .Err(e) => return .Err(e)
+    let mut rs: List[Value] = []
+    let mut cur: List[Value] = []
+    let last: Value = .Null
+    for (i, r) in items.iter().enumerate():
+        if i == 0 || compare(last, r.key) != 0:
+            if i > 0:
+                rs.push(arr(cur))
+            cur = [r.value]
+            last = r.key
+        else:
+            cur.push(r.value)
+    if !items.is_empty():
+        rs.push(arr(cur))
+    .V(arr(rs))
+
+fn func_unique(v: Value) -> Item:
+    unique_by("unique", v, v)
+
+fn func_unique_by(v: Value, x: Value) -> Item:
+    unique_by("unique_by", v, x)
+
+fn unique_by(name: string, v: Value, x: Value) -> Item:
+    let items = match sort_items(name, v, x):
+        .Ok(xs) => xs
+        .Err(e) => return .Err(e)
+    let mut rs: List[Value] = []
+    let last: Value = .Null
+    for (i, r) in items.iter().enumerate():
+        if i == 0 || compare(last, r.key) != 0:
+            rs.push(r.value)
+            last = r.key
+    .V(arr(rs))
+
+# ---------------------------------------------------------------- math
+
+fn func_significand(v: f64) -> f64:
+    let (frac, _) = gomath.frexp(v)
+    frac * 2.0
+
+fn func_exp10(v: f64) -> f64:
+    gomath.pow(10.0, v)
+
+fn func_frexp(v: Value) -> Item:
+    let .Some(x) = to_float64(v) else: return .Err(.Func0Type("frexp", v))
+    let (f, e) = gomath.frexp(x)
+    .V(arr([.Float(f), .Int(e)]))
+
+fn func_modf(v: Value) -> Item:
+    let .Some(x) = to_float64(v) else: return .Err(.Func0Type("modf", v))
+    if !x.is_finite() && !x.is_nan():
+        return .V(arr([.Float(0.0.copysign(x)), .Float(x)]))
+    let (i, f) = gomath.modf(x)
+    .V(arr([.Float(f), .Float(i)]))
+
+fn func_lgamma(v: f64) -> f64:
+    gomath.lgamma(v)._0
+
+fn func_drem(l: f64, r: f64) -> f64:
+    x := gomath.remainder(l, r)
+    if x == 0.0:
+        return x.copysign(l)
+    x
+
+fn func_fmax(l: f64, r: f64) -> f64:
+    if l.is_nan():
+        return r
+    if r.is_nan():
+        return l
+    if l > r: l else if r > l: r else if l == 0.0 && r == 0.0 && l.to_bits() >> 63 == 1: r else: l
+
+fn func_fmin(l: f64, r: f64) -> f64:
+    if l.is_nan():
+        return r
+    if r.is_nan():
+        return l
+    if l < r: l else if r < l: r else if l == 0.0 && r == 0.0 && l.to_bits() >> 63 == 1: l else: r
+
+LN2 := 0.693147180559945309417232121458176568
+
+fn func_jn(l: f64, r: f64) -> f64:
+    n := float_to_int(l)
+    x := r.abs()
+    if 0.0 < x && x < 1.0 / 0.0:
+        m := f64(n).abs()
+        if m * gomath.log(x / 2.0) - func_lgamma(m + 1.0) < -1076.0 * LN2:
+            if n & 1 != 0 && (n < 0) != (r < 0.0):
+                return -0.0
+            return 0.0
+    gomath.jn(n, r)
+
+fn func_ldexp(l: f64, r: f64) -> f64:
+    gomath.ldexp(l, float_to_int(r))
+
+fn func_yn(l: f64, r: f64) -> f64:
+    n := float_to_int(l)
+    m := f64(n).abs()
+    if 0.0 < r && r <= m - 1.0:
+        if gomath.log(2.0 / (3.141592653589793 * r)) + func_lgamma(m) - (m - 1.0) * gomath.log(r / 2.0) > 710.0:
+            if n < 0 && n & 1 != 0:
+                return 1.0 / 0.0
+            return -1.0 / 0.0
+    gomath.yn(n, r)
+
+fn func_infinite(_unused: Value) -> Item:
+    .V(.Float(1.0 / 0.0))
+
+fn func_isfinite(v: Value) -> Item:
+    match to_float64(v):
+        .Some(x) => .V(.Bool(x.is_finite() || x.is_nan()))
+        .None => .V(.Bool(false))
+
+fn func_isinfinite(v: Value) -> Item:
+    match to_float64(v):
+        .Some(x) => .V(.Bool(!x.is_finite() && !x.is_nan()))
+        .None => .V(.Bool(false))
+
+fn func_nan(_unused: Value) -> Item:
+    .V(.Float(0.0 / 0.0))
+
+fn func_isnan(v: Value) -> Item:
+    match to_float64(v):
+        .Some(x) => .V(.Bool(x.is_nan()))
+        .None => .V(.Bool(false))
+
+fn func_isnormal(v: Value) -> Item:
+    match to_float64(v):
+        .Some(x) =>
+            e := (x.to_bits() & 0x7ff0000000000000) >> 52
+            .V(.Bool(0 < e && e < 0x7ff))
+        .None => .V(.Bool(false))
+
+# ---------------------------------------------------------------- paths
+
+## funcAllocator
+pub fn func_allocator() -> Item:
+    .Alloc(box(Allocator {}))
+
+fn allocated(a: (*mut Allocator)?, owner: (*mut Allocator)?, gen: i64) -> bool:
+    match (a, owner):
+        (.Some(x), .Some(y)) => x is y && gen == x.gen
+        _ => false
+
+fn arr_allocated(a: (*mut Allocator)?, v: *mut ArrBox) -> bool:
+    allocated(a, v.alloc, v.gen)
+
+fn obj_allocated(a: (*mut Allocator)?, v: *mut ObjBox) -> bool:
+    allocated(a, v.alloc, v.gen)
+
+fn allocated_value(a: (*mut Allocator)?, v: Value) -> bool:
+    match v:
+        .Arr(b) => arr_allocated(a, b)
+        .Obj(b) => obj_allocated(a, b)
+        _ => false
+
+## clear(a): forget every allocated address.
+fn clear(a: *mut Allocator) -> void:
+    a.gen += 1
+
+fn make_object(a: (*mut Allocator)?, fields: Map[string, Value]) -> *mut ObjBox:
+    match a:
+        .Some(x) => box(ObjBox { fields: fields, alloc: .Some(x), gen: x.gen })
+        .None => box(ObjBox { fields: fields })
+
+fn make_array(a: (*mut Allocator)?, items: List[Value]) -> *mut ArrBox:
+    match a:
+        .Some(x) => box(ArrBox { items: items, alloc: .Some(x), gen: x.gen })
+        .None => box(ArrBox { items: items })
+
+fn alloc_arg(x: Item) -> *mut Allocator:
+    match x:
+        .Alloc(a) => a
+        _ => panic("expected an allocator")
+
+fn value_arg(x: Item) -> Value:
+    match x:
+        .V(v) => v
+        _ => panic("expected a value")
+
+fn func_setpath(v: Value, p: Value, n: Value) -> Item:
+    # There is no need to use an allocator on a single update.
+    setpath(v, p, n, .None)
+
+## Used in compileAssign and compileModify: args are path, value, allocator.
+pub fn func_setpath_with_allocator(v: Item, args: List[Item]) -> Item:
+    setpath(value_arg(v), value_arg(args[0]), value_arg(args[1]), .Some(alloc_arg(args[2])))
+
+## Used in compileModify: the update function may store the value anywhere,
+## so it must not be modified in place afterwards.
+pub fn func_getpath_with_allocator(v: Item, args: List[Item]) -> Item:
+    p := value_arg(args[0])
+    w := func_getpath(value_arg(v), p)
+    a := alloc_arg(args[1])
+    match w:
+        .V(x) =>
+            if allocated_value(.Some(a), x):
+                clear(a)
+        _ => pass
+    # A slice shares the backing array in Go; forget the addresses then.
+    match p:
+        .Arr(ps) =>
+            if !ps.items.is_empty():
+                match ps.items[ps.items.len() - 1]:
+                    .Obj(_) => clear(a)
+                    _ => pass
+        _ => pass
+    w
+
+fn setpath(v: Value, p: Value, n: Value, a: (*mut Allocator)?) -> Item:
+    let .Arr(path) = p else: return .Err(.Func1Type("setpath", v, p))
+    match update(v, path.items, 0, n, a):
+        .Ok(u) => .V(u)
+        .Err(e) => .Err(.Func2Wrap("setpath", v, p, n, box(e)))
+
+fn func_delpaths(v: Value, p: Value) -> Item:
+    delpaths(v, p, .Some(box(Allocator {})))
+
+## Used in compileModify: args are paths, allocator.
+pub fn func_delpaths_with_allocator(v: Item, args: List[Item]) -> Item:
+    delpaths(value_arg(v), value_arg(args[0]), .Some(alloc_arg(args[1])))
+
+fn is_sorted(xs: List[Value]) -> bool:
+    for i in 1..xs.len():
+        if compare(xs[i - 1], xs[i]) > 0:
+            return false
+    true
+
+fn delpaths(v: Value, p: Value, a: (*mut Allocator)?) -> Item:
+    let .Arr(pa) = p else: return .Err(.Func1Type("delpaths", v, p))
+    if pa.items.is_empty():
+        return .V(v)
+    # Sorts the paths to delete ancestor before descendant paths.
+    let mut paths = pa.items
+    if !is_sorted(paths):
+        paths.sort_by(fn(x, y): compare_ordering(compare(*x, *y)))
+    # Fills the paths with an empty value and then delete them.
+    let u = v
+    for q in paths:
+        let .Arr(path) = q else:
+            return .Err(.Func1Wrap("delpaths", v, p, box(JqError.ExpectedArray(q))))
+        match update(u, path.items, 0, .Hole, a):
+            .Ok(w) => u = w
+            .Err(e) => return .Err(.Func1Wrap("delpaths", v, p, box(e)))
+    .V(delete_empty(u))
+
+fn is_hole(v: Value) -> bool:
+    match v:
+        .Hole => true
+        _ => false
+
+## update(v, path[k:], n, a)
+fn update(v: Value, path: List[Value], k: usize, n: Value, a: (*mut Allocator)?) -> Result[Value, JqError]:
+    if k == path.len():
+        return .Ok(n)
+    match path[k]:
+        .Str(p) =>
+            match v:
+                .Null => update_object(.None, p, path, k + 1, n, a)
+                .Obj(m) => update_object(.Some(m), p, path, k + 1, n, a)
+                .Hole => .Ok(v)
+                _ => .Err(.ExpectedObject(v))
+        .Int(_) => update_index(v, path, k, n, a)
+        .Float(_) => update_index(v, path, k, n, a)
+        .Big(_) => update_index(v, path, k, n, a)
+        .Number(_) => update_index(v, path, k, n, a)
+        .Obj(m) =>
+            match v:
+                .Null => update_array_slice(.None, m, path, k + 1, n, a)
+                .Arr(b) => update_array_slice(.Some(b), m, path, k + 1, n, a)
+                .Hole => .Ok(v)
+                _ => .Err(.ExpectedArray(v))
+        _ =>
+            match v:
+                .Arr(_) => .Err(.ArrayIndexNotNumber(path[k]))
+                _ => .Err(.ObjectKeyNotString(path[k]))
+
+fn update_index(v: Value, path: List[Value], k: usize, n: Value, a: (*mut Allocator)?) -> Result[Value, JqError]:
+    i := to_int(path[k]).unwrap_or(0)
+    match v:
+        .Null => update_array_index(.None, i, path, k + 1, n, a)
+        .Arr(b) => update_array_index(.Some(b), i, path, k + 1, n, a)
+        .Hole => .Ok(v)
+        _ => .Err(.ExpectedArray(v))
+
+fn update_object(v: (*mut ObjBox)?, key: string, path: List[Value], k: usize, n: Value, a: (*mut Allocator)?) -> Result[Value, JqError]:
+    let x: Value = .Null
+    let ok = false
+    match v:
+        .Some(m) =>
+            match m.fields.get(key):
+                .Some(w) =>
+                    x = w
+                    ok = true
+                .None => pass
+        .None => pass
+    if !ok && is_hole(n):
+        return match v:
+            .Some(m) => .Ok(.Obj(m))
+            .None => .Ok(.Null)
+    u := update(x, path, k, n, a)?
+    match v:
+        .Some(m) =>
+            if obj_allocated(a, m):
+                m.fields[key] = u
+                return .Ok(.Obj(m))
+            let mut w = m.fields
+            w[key] = u
+            .Ok(.Obj(make_object(a, w)))
+        .None =>
+            let mut w: Map[string, Value] = {}
+            w[key] = u
+            .Ok(.Obj(make_object(a, w)))
+
+fn update_array_index(v: (*mut ArrBox)?, i0: i64, path: List[Value], k: usize, n: Value, a: (*mut Allocator)?) -> Result[Value, JqError]:
+    let i = i0
+    l := match v:
+        .Some(b) => i64(b.items.len())
+        .None => 0i64
+    let x: Value = .Null
+    j := clamp_index(i, -1, l)
+    if j < 0:
+        if is_hole(n):
+            return match v:
+                .Some(b) => .Ok(.Arr(b))
+                .None => .Ok(.Null)
+        return .Err(.ArrayIndexNegative(i))
+    else if j < l:
+        i = j
+        match v:
+            .Some(b) => x = b.items[usize(i)]
+            .None => pass
+    else:
+        if is_hole(n):
+            return match v:
+                .Some(b) => .Ok(.Arr(b))
+                .None => .Ok(.Null)
+        if i >= 0x20000000:
+            return .Err(.ArrayIndexTooLarge(.Int(i)))
+    u := update(x, path, k, n, a)?
+    match v:
+        .Some(b) =>
+            if arr_allocated(a, b):
+                while i64(b.items.len()) <= i:
+                    b.items.push(.Null)
+                b.items[usize(i)] = u
+                return .Ok(.Arr(b))
+        .None => pass
+    let mut w: List[Value] = match v:
+        .Some(b) => b.items
+        .None => []
+    while i64(w.len()) <= i:
+        w.push(.Null)
+    w[usize(i)] = u
+    .Ok(.Arr(make_array(a, w)))
+
+fn update_array_slice(v: (*mut ArrBox)?, m: *mut ObjBox, path: List[Value], k: usize, n: Value, a: (*mut Allocator)?) -> Result[Value, JqError]:
+    let .Some(s) = m.fields.get("start") else: return .Err(.ExpectedStartEnd(.Obj(m)))
+    let .Some(e) = m.fields.get("end") else: return .Err(.ExpectedStartEnd(.Obj(m)))
+    l := match v:
+        .Some(b) => i64(b.items.len())
+        .None => 0i64
+    let start = 0i64
+    let end = 0i64
+    match s:
+        .Null => pass
+        _ =>
+            match to_int_floor(s):
+                .Some(i) => start = clamp_index(i, 0, l)
+                .None => return .Err(.ArrayIndexNotNumber(s))
+    match e:
+        .Null => end = l
+        _ =>
+            match to_int_ceil(e):
+                .Some(i) => end = clamp_index(i, start, l)
+                .None => return .Err(.ArrayIndexNotNumber(e))
+    if start == end && is_hole(n):
+        return match v:
+            .Some(b) => .Ok(.Arr(b))
+            .None => .Ok(.Null)
+    let sub: List[Value] = match v:
+        .Some(b) => b.items.slice(usize(start), usize(end))
+        .None => []
+    u := update(arr(sub), path, k, n, a)?
+    let in_place = match v:
+        .Some(b) => arr_allocated(a, b)
+        .None => false
+    match u:
+        .Arr(ub) =>
+            if i64(ub.items.len()) == end - start && in_place:
+                let .Some(b) = v else: return .Ok(.Null)
+                for (t, x) in ub.items.iter().enumerate():
+                    b.items[usize(start) + t] = x
+                return .Ok(.Arr(b))
+            let mut w: List[Value] = match v:
+                .Some(b) => b.items.slice(0, usize(start))
+                .None => []
+            w.extend(ub.items)
+            match v:
+                .Some(b) => w.extend(b.items.slice(usize(end), b.items.len()))
+                .None => pass
+            .Ok(.Arr(make_array(a, w)))
+        .Hole =>
+            if in_place:
+                let .Some(b) = v else: return .Ok(.Null)
+                for t in start..end:
+                    b.items[usize(t)] = .Hole
+                return .Ok(.Arr(b))
+            let mut w: List[Value] = match v:
+                .Some(b) => b.items
+                .None => []
+            for t in start..end:
+                w[usize(t)] = .Hole
+            .Ok(.Arr(make_array(a, w)))
+        _ => .Err(.ExpectedArray(u))
+
+fn delete_empty(v: Value) -> Value:
+    match v:
+        .Hole => .Null
+        .Obj(m) =>
+            let mut ks: List[string] = []
+            for (k, _) in m.fields:
+                ks.push(*k)
+            for k in ks:
+                w := m.fields[k]
+                if is_hole(w):
+                    _ := m.fields.remove(k)
+                else:
+                    m.fields[k] = delete_empty(w)
+            v
+        .Arr(b) =>
+            let mut xs: List[Value] = []
+            for w in b.items:
+                if !is_hole(w):
+                    xs.push(delete_empty(w))
+            b.items = xs
+            v
+        _ => v
+
+fn func_getpath(v: Value, p: Value) -> Item:
+    let .Arr(path) = p else: return .Err(.Func1Type("getpath", v, p))
+    let u = v
+    for x in path.items:
+        match func_index2(.Null, u, x):
+            .V(w) => u = w
+            .Err(e) => return .Err(.Func1Wrap("getpath", v, p, box(e)))
+            _ => pass
+    .V(u)
+
+fn func_transpose(v: Value) -> Item:
+    let .Arr(vss) = v else: return .Err(.Func0Type("transpose", v))
+    if vss.items.is_empty():
+        return .V(arr([]))
+    let l = 0usize
+    for vs in vss.items:
+        let .Arr(b) = vs else: return .Err(.Func0Type("transpose", v))
+        if l < b.items.len():
+            l = b.items.len()
+    k := vss.items.len()
+    let mut wss: List[List[Value]] = [for _ in 0..l => [for _ in 0..k => Value.Null]]
+    for (i, vs) in vss.items.iter().enumerate():
+        let .Arr(b) = vs else: continue
+        for (j, x) in b.items.iter().enumerate():
+            wss[j][i] = x
+    .V(arr([for ws in wss => arr(ws)]))
+
+fn func_bsearch(v: Value, t: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func1Type("bsearch", v, t))
+    # slices.BinarySearchFunc
+    let lo = 0usize
+    let hi = a.items.len()
+    while lo < hi:
+        h := (lo + hi) / 2
+        if compare(a.items[h], t) < 0:
+            lo = h + 1
+        else:
+            hi = h
+    if lo < a.items.len() && compare(a.items[lo], t) == 0:
+        return .V(.Int(i64(lo)))
+    .V(.Int(-i64(lo) - 1))
+
+# ---------------------------------------------------------------- time
+
+fn func_gmtime(v: Value) -> Item:
+    time_to_array_func("gmtime", v, time.utc())
+
+fn func_localtime(v: Value, local: *mut Location) -> Item:
+    time_to_array_func("localtime", v, local)
+
+fn time_to_array_func(name: string, v: Value, loc: *mut Location) -> Item:
+    let .Some(w) = to_float64(v) else: return .Err(.Func0Type(name, v))
+    match epoch_to_time(w, loc):
+        .Ok(t) => .V(time_to_array(t))
+        .Err(e) => .Err(.Func0Wrap(name, v, box(e)))
+
+fn epoch_to_time(v: f64, loc: *mut Location) -> Result[Time, JqError]:
+    i := v.floor()
+    f := v - i
+    if !(-9223372036854775808.0 <= i && i < 9223372036854775807.0):
+        return .Err(.TimeEpoch)
+    t := time.unix(i64(i), i64(f * 1e9)).in_loc(loc)
+    if i < 0.0 && t.year() > 1970:
+        return .Err(.TimeEpoch)
+    .Ok(t)
+
+fn time_to_array(t: Time) -> Value:
+    let (year, month, day) = t.date()
+    let (hour, minute, second) = t.clock()
+    arr([
+        .Int(year),
+        .Int(month - 1),
+        .Int(day),
+        .Int(hour),
+        .Int(minute),
+        .Float(f64(second) + f64(t.nanosecond()) / 1e9),
+        .Int(t.weekday()),
+        .Int(t.year_day() - 1),
+    ])
+
+fn func_mktime(v: Value) -> Item:
+    let .Arr(a) = v else: return .Err(.Func0Type("mktime", v))
+    match array_to_time(a.items, time.utc()):
+        .Ok(t) => .V(.Float(time_to_epoch(t)))
+        .Err(e) => .Err(.Func0Wrap("mktime", v, box(e)))
+
+fn time_to_epoch(t: Time) -> f64:
+    f64(t.unix()) + f64(t.nanosecond()) / 1e9
+
+fn func_strftime(v: Value, x: Value) -> Item:
+    format_time_func("strftime", v, x, time.utc())
+
+fn format_time_func(name: string, v: Value, x: Value, loc: *mut Location) -> Item:
+    let .Str(format) = x else: return .Err(.Func1Type(name, v, x))
+    let t = match to_float64(v):
+        .Some(w) =>
+            match epoch_to_time(w, loc):
+                .Ok(t) => t
+                .Err(e) => return .Err(.Func1Wrap(name, v, x, box(e)))
+        .None =>
+            let .Arr(a) = v else: return .Err(.Func1Type(name, v, x))
+            match array_to_time(a.items, loc):
+                .Ok(t) => t
+                .Err(e) => return .Err(.Func1Wrap(name, v, x, box(e)))
+    .V(.Str(timefmt.format(t, format)))
+
+fn func_strptime(v: Value, x: Value, local: *mut Location) -> Item:
+    let .Str(s) = v else: return .Err(.Func1Type("strptime", v, x))
+    let .Str(format) = x else: return .Err(.Func1Type("strptime", v, x))
+    match timefmt.parse(s, format, local):
+        .Ok(t) => .V(time_to_array(t.utc()))
+        .Err(e) => .Err(.Func1Wrap("strptime", v, x, box(JqError.Message(e))))
+
+fn array_to_time(a: List[Value], loc: *mut Location) -> Result[Time, JqError]:
+    # year, month, day, hour, minute, second, weekday, yearday
+    let mut fields: List[i64] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let nanosecond = 0i64
+    for i in 0..8:
+        if i >= a.len():
+            break
+        let .Some(v) = to_float64(a[i]) else: return .Err(.TimeArray)
+        if !(-9223372036854775808.0 <= v && v < 9223372036854775807.0):
+            return .Err(.TimeNumber)
+        if i == 5:
+            fields[i] = i64(v.floor())
+            nanosecond = i64((v - v.floor()) * 1e9)
+        else:
+            fields[i] = to_int(a[i]).unwrap_or(0)
+    .Ok(time.date(fields[0], fields[1] + 1, fields[2], fields[3], fields[4], fields[5], nanosecond, loc))
+
+## funcNow, given the current time.
+pub fn func_now(unix_nanos: i64) -> Item:
+    .V(.Float(f64(unix_nanos / 1000000000) + f64(unix_nanos % 1000000000) / 1e9))
+
+## The functions reading time.Local.
+pub fn call_local(name: string, v: Value, args: List[Value], local: *mut Location) -> Item:
+    match name:
+        "localtime" => func_localtime(v, local)
+        "strflocaltime" => format_time_func("strflocaltime", v, args[0], local)
+        "strptime" => func_strptime(v, args[0], local)
+        _ => .Err(.Message("unknown local function $name"))
+
+# ---------------------------------------------------------------- regexp
+
+## regexpMatcher
+pub struct RegexpMatcher:
+    re: *mut Regexp
+    probe: (*mut Regexp)?
+
+## The sync.Map of compiled regular expressions.
+pub struct RegexpCache:
+    entries: Map[string, *mut RegexpMatcher] = {}
+
+pub fn new_regexp_cache() -> *mut RegexpCache:
+    box(RegexpCache {})
+
+pub fn func_match(v: Value, re: Value, fs: Value, testing: Value, cache: *mut RegexpCache) -> Item:
+    is_test := match testing:
+        .Bool(b) => b
+        _ => false
+    name := if is_test: "test" else: "match"
+    let flags = ""
+    match fs:
+        .Null => pass
+        .Str(f) => flags = f
+        _ => return .Err(.Func2Type(name, v, re, fs))
+    let .Str(s) = v else: return .Err(.Func2Type(name, v, re, fs))
+    let .Str(restr) = re else: return .Err(.Func2Type(name, v, re, fs))
+    r := match compile_regexp(restr, flags, cache):
+        .Ok(r) => r
+        .Err(e) => return .Err(e)
+    if is_test:
+        return .V(.Bool(r.re.match_string(s)))
+    n := if flags.contains("g"): -1i64 else: 1
+    xs := find_all_string_submatch_index(r, s, n)
+    names := r.re.subexp_names()
+    let mut res: List[Value] = []
+    let prev = 0usize
+    let offset = 0i64
+    for x in xs:
+        x0 := usize(x[0])
+        offset += i64(s.slice(prev, x0).chars().count())
+        prev = x0
+        let mut captures: List[Value] = []
+        for j in 1..(x.len() / 2):
+            let nm: Value = if names[j] != "": .Str(names[j]) else: .Null
+            if x[j * 2] < 0:
+                captures.push(obj({"name": nm, "offset": .Int(-1), "length": .Int(0), "string": .Null}))
+                continue
+            a := usize(x[j * 2])
+            b := usize(x[j * 2 + 1])
+            captures.push(obj({
+                "name": nm,
+                "offset": .Int(offset + i64(s.slice(x0, a).chars().count())),
+                "length": .Int(i64(s.slice(a, b).chars().count())),
+                "string": .Str(s.slice(a, b)),
+            }))
+        x1 := usize(x[1])
+        res.push(obj({
+            "offset": .Int(offset),
+            "length": .Int(i64(s.slice(x0, x1).chars().count())),
+            "string": .Str(s.slice(x0, x1)),
+            "captures": arr(captures),
+        }))
+    .V(arr(res))
+
+fn compile_regexp(re0: string, flags: string, cache: *mut RegexpCache) -> Result[*mut RegexpMatcher, JqError]:
+    key := re0 + "\u{0}" + flags
+    match cache.entries.get(key):
+        .Some(r) => return .Ok(r)
+        .None => pass
+    for c in flags.chars():
+        if c != 'g' && c != 'i' && c != 'm':
+            return .Err(.Message("unsupported regular expression flag: ${quote(flags)}"))
+    let re = re0
+    if flags.contains("i"):
+        re = "(?i)" + re
+    if flags.contains("m"):
+        re = "(?s)" + re
+    r := match regexp.compile(re):
+        .Ok(r) => r
+        .Err(e) => return .Err(.Message("invalid regular expression ${quote(re)}: $e"))
+    let probe: (*mut Regexp)? = match regexp.compile("\\A(?s:.)(?:" + re + ")"):
+        .Ok(p) => .Some(p)
+        .Err(_) => .None
+    m := box(RegexpMatcher { re: r, probe: probe })
+    cache.entries[key] = m
+    .Ok(m)
+
+fn find_all_string_submatch_index(r: *mut RegexpMatcher, s: string, n: i64) -> List[List[i64]]:
+    xs := r.re.find_all_string_submatch_index(s, n)
+    let .Some(probe) = r.probe else: return xs
+    if xs.is_empty() || n == 1:
+        return xs
+    let mut ys: List[List[i64]] = []
+    for (i, x) in xs.iter().enumerate():
+        ys.push(x)
+        if x[0] == x[1] || (i + 1 < xs.len() && xs[i + 1][0] == x[1]):
+            continue
+        match empty_match_at(probe, s, usize(x[1])):
+            .Some(y) => ys.push(y)
+            .None => pass
+    ys
+
+fn empty_match_at(probe: *mut Regexp, s: string, offset: usize) -> (List[i64])?:
+    # the width of the last rune of s[:offset]
+    let w = 0usize
+    for (b, _) in s.slice(0, offset).char_indices():
+        w = offset - b
+    let .Some(x) = probe.find_string_submatch_index(s.slice(offset - w, s.len())) else:
+        return .None
+    if x[1] != i64(w):
+        return .None
+    let mut y: List[i64] = [i64(offset), i64(offset)]
+    for i in 2..x.len():
+        y.push(if x[i] < 0: -1i64 else: x[i] + i64(offset) - i64(w))
+    .Some(y)
+
+fn func_captures(v: Value) -> Item:
+    let .Arr(captures) = v else: return .Err(.ExpectedArray(v))
+    let mut w: Map[string, Value] = {}
+    for capture in captures.items:
+        match capture:
+            .Obj(c) =>
+                match c.fields.get("name"):
+                    .Some(.Str(name)) => w[name] = c.fields.get("string").unwrap_or(Value.Null)
+                    _ => pass
+            _ => pass
+    .V(obj(w))
+
+fn func_error(v: Value, args: List[Value]) -> Item:
+    let x = v
+    if !args.is_empty():
+        x = args[0]
+    .Err(.ExitCode(x, 5))
+
+fn func_halt(_unused: Value) -> Item:
+    .Err(.Halt(.Null, 0))
+
+fn func_halt_error(v: Value, args: List[Value]) -> Item:
+    let code = 5i64
+    if !args.is_empty():
+        match to_int(args[0]):
+            .Some(c) => code = c
+            .None => return .Err(.Func0Type("halt_error", args[0]))
+    .Err(.Halt(v, code))
+
+fn to_int_ceil(x0: Value) -> i64?:
+    let x = match x0:
+        .Number(s) => parse_number(s)
+        _ => x0
+    match x:
+        .Float(f) =>
+            if (-1.0 < f && f < 0.0) || f.is_nan():
+                return .Some(9223372036854775807)
+            to_int(.Float(f.ceil()))
+        _ => to_int(x)
+
+fn to_int_floor(x0: Value) -> i64?:
+    let x = match x0:
+        .Number(s) => parse_number(s)
+        _ => x0
+    match x:
+        .Float(f) => to_int(.Float(f.floor()))
+        _ => to_int(x)

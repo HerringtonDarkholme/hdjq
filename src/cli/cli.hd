@@ -1,0 +1,348 @@
+## Port of gojq/cli/cli.go and cli/run.go (without YAML input and output).
+## isatty has no hd counterpart, so stdout counts as not a terminal.
+use std.console.ConsoleInput
+use std.fs.{FsRead, FsWrite, read_bytes}
+use std.path.Path
+use std.time.Clock
+use std.host.Env
+use pkg.goshim.value.{Value, arr, obj, is_falsy}
+use pkg.goshim.json.new_decoder
+use pkg.goshim.encoding.{lossy, trim_space}
+use pkg.goshim.time.init_local
+use pkg.gojq.query.Query
+use pkg.gojq.parser.parse
+use pkg.gojq.error.{JqError, error_string, value_of}
+use pkg.gojq.iter.Item
+use pkg.gojq.compiler.{compile, Options, CompiledCode, CustomFunctions, with_function}
+use pkg.gojq.env.run_code
+use pkg.gojq.code.debug_codes
+use pkg.gojq.module_loader.{new_module_loader, fs_error_string}
+use pkg.cli.flags.{FlagOpts, parse_flags, format_flags}
+use pkg.cli.color.{Colors, colors, set_colors}
+use pkg.cli.encoder.{Encoder, new_encoder, write_stream, write_raw}
+use pkg.cli.marshaler.{Marshaler, marshal}
+use pkg.cli.error.{CliError, JsonErrKind, cli_error_string, cli_exit_code, is_empty_error, exit_code_ok, exit_code_falsy_err, exit_code_no_value_err, exit_code_default_err}
+use pkg.cli.inputs.{CliIter, Reader, IterKind, InputAdapter, stdin_reader, new_iter, new_null_input_iter, new_files_input_iter, new_slurp_input_iter, new_slurp_raw_input_iter, new_json_input_iter}
+
+NAME := "gojq"
+VERSION := "0.12.20"
+REVISION := "HEAD"
+
+pub struct Cli:
+    output_raw: bool = false
+    output_raw0: bool = false
+    output_join: bool = false
+    output_compact: bool = false
+    output_indent: i64? = .None
+    output_tab: bool = false
+    input_raw: bool = false
+    input_stream: bool = false
+    input_slurp: bool = false
+    argnames: List[string] = []
+    argvalues: List[Value] = []
+    exit_code_error: CliError? = .None
+    stdin: *mut Reader
+
+## Run gojq.
+pub fn run!(args: List[string]) -> i64 $ Console + ConsoleInput + FsRead + FsWrite + Clock + Env:
+    let mut c = Cli { stdin: stdin_reader() }
+    match c.run_internal!(args):
+        .Ok(_) => exit_code_ok()
+        .Err(err) =>
+            if !is_empty_error(err):
+                write_raw!(true, "$NAME: ${cli_error_string(err)}\n")
+            cli_exit_code(err).unwrap_or(exit_code_default_err())
+
+## The custom functions the CLI defines: debug, stderr and input_filename.
+struct CliFuncs:
+    iter: *mut dyn CliIter
+    has_args: bool
+    null_input: bool
+
+impl CustomFunctions for CliFuncs:
+    fn call!(&mut self, name: string, v: Value, args: List[Value]) -> Item $ Console + FsWrite:
+        match name:
+            "debug" =>
+                new_encoder(false, -1).marshal(arr([.Str("DEBUG:"), v]), true)
+                write_stream(true, "\n")
+                .V(v)
+            "stderr" =>
+                _ := marshal!(.Raw(new_encoder(false, -1), false), v, true)
+                .V(v)
+            "input_filename" =>
+                fname := self.iter.name()
+                if fname != "" && (self.has_args || !self.null_input):
+                    return .V(.Str(fname))
+                .V(.Null)
+            _ => .Err(.FuncNotFound(name, i64(args.len())))
+
+fn help_text() -> string:
+    "$NAME - Go implementation of jq\n\nVersion: $VERSION (rev: $REVISION/hd)\n\nSynopsis:\n  % echo '{\"foo\": 128}' | $NAME '.foo'\n\nUsage:\n  $NAME [OPTIONS]\n\n"
+
+fn environ() -> List[string] $ Env:
+    let mut xs: List[string] = []
+    for name in $.use(Env).names():
+        match $.use(Env).get(name):
+            .Some(v) => xs.push("$name=$v")
+            .None => pass
+    xs
+
+impl Cli:
+    fn run_internal!(&mut self, args0: List[string]) -> Result[void, CliError] $ Console + ConsoleInput + FsRead + FsWrite + Clock + Env:
+        let mut opts = FlagOpts {}
+        let args = match parse_flags(args0, &mut opts):
+            .Ok(rest) => rest
+            .Err(msg) => return .Err(.FlagParse(msg))
+        if opts.flag("help"):
+            write_stream(false, help_text())
+            write_stream(false, format_flags() + "\n")
+            return .Ok(())
+        if opts.flag("version"):
+            write_stream(false, "$NAME $VERSION (rev: $REVISION/hd)\n")
+            return .Ok(())
+        self.output_raw = opts.flag("raw-output")
+        self.output_raw0 = opts.flag("raw-output0")
+        self.output_join = opts.flag("join-output")
+        self.output_compact = opts.flag("compact-output")
+        self.output_indent = opts.int("indent")
+        self.output_tab = opts.flag("tab")
+        if opts.flag("color-output") || opts.flag("monochrome-output"):
+            colors().no_color = opts.flag("monochrome-output")
+        else if $.use(Env).get("NO_COLOR").unwrap_or("") != "" || $.use(Env).get("TERM").unwrap_or("") == "dumb":
+            colors().no_color = true
+        else:
+            colors().no_color = true
+        if !colors().no_color:
+            spec := $.use(Env).get("GOJQ_COLORS").unwrap_or("")
+            if spec != "":
+                match set_colors(colors(), spec):
+                    .Ok(_) => pass
+                    .Err(e) => return .Err(.Message(e))
+        match self.output_indent:
+            .Some(i) =>
+                if i > 9:
+                    return .Err(.Message("too many indentation count: $i"))
+                else if i < 0:
+                    return .Err(.Message("negative indentation count: $i"))
+            .None => pass
+        self.input_raw = opts.flag("raw-input")
+        self.input_stream = opts.flag("stream")
+        self.input_slurp = opts.flag("slurp")
+        for (k, v) in opts.pairs("arg"):
+            self.argnames.push("\$" + k)
+            self.argvalues.push(.Str(v))
+        for (k, v) in opts.pairs("argjson"):
+            val := parse_json_arg(v, "\$" + k)?
+            self.argnames.push("\$" + k)
+            self.argvalues.push(val)
+        for (k, v) in opts.pairs("slurpfile"):
+            val := self.slurp_file!(v)?
+            self.argnames.push("\$" + k)
+            self.argvalues.push(val)
+        for (k, v) in opts.pairs("rawfile"):
+            match read_bytes!(Path(v)):
+                .Ok(b) =>
+                    self.argnames.push("\$" + k)
+                    self.argvalues.push(.Str(lossy(b)))
+                .Err(e) => return .Err(.Message(fs_error_string("open", v, e)))
+        let mut named: Map[string, Value] = {}
+        for (i, name) in self.argnames.iter().enumerate():
+            named[name.slice(1, name.len())] = self.argvalues[i]
+        let mut positional: List[Value] = []
+        for x in opts.positional("args"):
+            match x:
+                .Some(s) => positional.push(.Str(s))
+                .None => positional.push(.Null)
+        for (i, x) in opts.positional("jsonargs").iter().enumerate():
+            match x:
+                .Some(s) =>
+                    val := parse_json_arg(s, "--jsonargs")?
+                    if i < positional.len():
+                        positional[i] = val
+                    else:
+                        positional.push(val)
+                .None => pass
+        self.argnames.push("\$ARGS")
+        self.argvalues.push(obj({"named": obj(named), "positional": arr(positional)}))
+        let arg = ""
+        let fname = ""
+        let mut rest = args
+        if opts.flag("from-file"):
+            if rest.is_empty():
+                return .Err(.Message("expected a query file for flag `-f'"))
+            match read_bytes!(Path(rest[0])):
+                .Ok(b) => arg = lossy(b)
+                .Err(e) => return .Err(.Message(fs_error_string("open", rest[0], e)))
+            fname = rest[0]
+            rest = rest.slice(1, rest.len())
+        else if rest.is_empty():
+            arg = "."
+        else:
+            arg = trim_space(rest[0])
+            fname = "<arg>"
+            rest = rest.slice(1, rest.len())
+        if opts.flag("exit-status"):
+            self.exit_code_error = .Some(.ExitCode(exit_code_no_value_err()))
+        r := self.run_query!(arg, fname, rest, opts)
+        if opts.flag("exit-status"):
+            match r:
+                .Err(e) =>
+                    if cli_exit_code(e).is_some():
+                        return .Err(e)
+                .Ok(_) => pass
+            match self.exit_code_error:
+                .Some(e) => return .Err(e)
+                .None => return .Ok(())
+        r
+
+    fn run_query!(&mut self, arg: string, fname: string, args: List[string], opts: FlagOpts) -> Result[void, CliError] $ Console + ConsoleInput + FsRead + FsWrite + Clock + Env:
+        let query = match parse(arg):
+            .Ok(q) => q
+            .Err(e) => return .Err(.QueryParse(fname, arg, e))
+        let mut module_paths = opts.slice("library-path")
+        if module_paths.is_empty():
+            module_paths = ["~/.jq", "\$ORIGIN/../lib/gojq", "\$ORIGIN/../lib"]
+        init_local!($.use(Env).get("TZ"))
+        let iter = self.create_input_iter(args)
+        let mut copts = Options {
+            module_loader: .Some(new_module_loader(module_paths, $.use(Env).get("HOME"))),
+            environ: .Some(environ()),
+            variables: self.argnames,
+            custom: .Some(box(CliFuncs { iter: iter, has_args: !args.is_empty(), null_input: opts.flag("null-input") })),
+            input_iter: .Some(box(InputAdapter { it: iter })),
+        }
+        with_function(&mut copts, "debug", 0, 0, false)
+        with_function(&mut copts, "stderr", 0, 0, false)
+        with_function(&mut copts, "input_filename", 0, 0, false)
+        let code = match compile!(query, copts):
+            .Ok(c) => c
+            .Err(e) =>
+                match e:
+                    .QueryParse(name, q, err) => return .Err(.QueryParse(name, q, *err))
+                    .JsonParse(fname2, contents, err) =>
+                        let kind: JsonErrKind = match *err:
+                            .JsonSyntax(msg, off) => .Syntax(msg, off)
+                            _ => .UnexpectedEOF
+                        return .Err(.Compile(.Message(cli_error_string(.JsonParse(fname2, contents.bytes().collect(), 0, kind)))))
+                    _ => return .Err(.Compile(e))
+        match $.use(Env).get("GOJQ_DEBUG"):
+            .Some(out) =>
+                if out != "":
+                    write_stream(out != "stdout", debug_codes(code.codes))
+            .None => pass
+        let mut process_iter = iter
+        if opts.flag("null-input"):
+            process_iter = new_null_input_iter()
+        r := self.process!(process_iter, code)
+        iter.close()
+        r
+
+    fn slurp_file!(&mut self, name: string) -> Result[Value, CliError] $ ConsoleInput + FsRead:
+        it := new_slurp_input_iter(new_files_input_iter(.Json, [name], .None))
+        match it.next!():
+            .Some(.V(v)) => .Ok(v)
+            .Some(.Err(e)) => .Err(.Jq(e))
+            _ => .Ok(.Null)
+
+    fn create_input_iter(&mut self, args: List[string]) -> *mut dyn CliIter:
+        let kind: IterKind = if self.input_raw:
+            if self.input_slurp: .ReadAll else: .Raw
+        else if self.input_stream:
+            .Stream
+        else:
+            .Json
+        let iter: *mut dyn CliIter = if args.is_empty():
+            new_iter(kind, self.stdin, "<stdin>")
+        else:
+            new_files_input_iter(kind, args, .Some(self.stdin))
+        if self.input_slurp:
+            if self.input_raw:
+                return new_slurp_raw_input_iter(iter)
+            return new_slurp_input_iter(iter)
+        iter
+
+    fn process!(&mut self, iter: *mut dyn CliIter, code: CompiledCode) -> Result[void, CliError] $ Console + ConsoleInput + FsRead + FsWrite + Clock:
+        let err: CliError? = .None
+        while true:
+            let v = match iter.next!():
+                .None => break
+                .Some(.V(v)) => v
+                .Some(.Err(e)) =>
+                    write_raw!(true, "$NAME: ${error_string(e)}\n")
+                    err = .Some(.Jq(e))
+                    continue
+                .Some(_) => continue
+            match self.print_values!(code, v):
+                .Ok(_) => pass
+                .Err(e) =>
+                    match e:
+                        .Halt(hv, _) =>
+                            match hv:
+                                .Null => pass
+                                _ => _ := marshal!(.Raw(new_encoder(false, -1), false), hv, true)
+                            err = .Some(.Jq(e))
+                            break
+                        _ =>
+                            write_raw!(true, "$NAME: ${error_string(e)}\n")
+                            err = .Some(.Jq(e))
+        match err:
+            .Some(e) => .Err(.Empty(box(e)))
+            .None => .Ok(())
+
+    fn print_values!(&mut self, code: CompiledCode, v: Value) -> Result[void, JqError] $ Console + ConsoleInput + FsRead + FsWrite + Clock:
+        m := self.create_marshaler()
+        env := run_code(code, v, self.argvalues)?
+        while true:
+            let w = match env.next!():
+                .None => break
+                .Some(.V(w)) => w
+                .Some(.Err(e)) => return .Err(e)
+                .Some(_) => continue
+            match marshal!(m, w, false):
+                .Ok(_) => pass
+                .Err(msg) => return .Err(.Message(msg))
+            match self.exit_code_error:
+                .Some(_) =>
+                    self.exit_code_error = .Some(.ExitCode(if is_falsy(w): exit_code_falsy_err() else: exit_code_ok()))
+                .None => pass
+            if self.output_raw0:
+                write_stream(false, "\u{0}")
+            else if !self.output_join:
+                write_stream(false, "\n")
+        .Ok(())
+
+    fn create_marshaler(&self) -> Marshaler:
+        let indent = 2i64
+        if self.output_compact:
+            indent = -1
+        else if self.output_tab:
+            indent = 1
+        else:
+            match self.output_indent:
+                .Some(i) => indent = i
+                .None => pass
+        f := new_encoder(self.output_tab, indent)
+        if self.output_raw || self.output_raw0 || self.output_join:
+            return .Raw(f, self.output_raw0)
+        .Enc(f)
+
+## parseJSONArg
+fn parse_json_arg(value: string, name: string) -> Result[Value, CliError]:
+    dec := new_decoder(value)
+    let v = match dec.decode():
+        .Ok(.Some(v)) => v
+        .Ok(.None) => return .Err(.JsonParse(name, value.bytes().collect(), 0, .UnexpectedEOF))
+        .Err(e) =>
+            let kind: JsonErrKind = match e:
+                .Syntax(msg, off) => .Syntax(msg, off)
+                .UnexpectedEOF => .UnexpectedEOF
+            return .Err(.JsonParse(name, value.bytes().collect(), 0, kind))
+    offset := usize(dec.input_offset())
+    match dec.token():
+        .Ok(.None) => .Ok(v)
+        _ =>
+            let rest = value.slice(offset, value.len())
+            while rest.starts_with(" ") || rest.starts_with("\t") || rest.starts_with("\n") || rest.starts_with("\r"):
+                rest = rest.slice(1, rest.len())
+            ch := rest.chars().next().unwrap_or('\u{FFFD}')
+            .Err(.JsonParse(name, value.bytes().collect(), 0, .Trailing(ch, i64(value.len() - rest.len()) + 1)))

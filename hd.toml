@@ -1,0 +1,14 @@
+[package]
+name = "gojqhd"
+
+[capabilities]
+Console = true
+ConsoleInput = true
+Args = true
+Env = true
+FsRead = true
+FsWrite = true
+Clock = true
+
+[dev-capabilities]
+Process = true

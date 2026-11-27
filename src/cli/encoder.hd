@@ -1,0 +1,189 @@
+## Port of gojq/cli/encoder.go. The encoder writes to stdout or stderr in
+## pieces, as Go writes to an io.Writer: when its buffer passes 8KiB and at
+## the end of each value.
+use std.text.StringBuilder
+use pkg.goshim.value.{Value, ArrBox, ObjBox}
+use pkg.goshim.bigint
+use pkg.gojq.encoder.{encode_float64, sorted_keys, is_marker_at}
+use std.fs.{FsWrite, write_bytes}
+use std.path.Path
+use pkg.goshim.encoding.{display, go_bytes, may_have_markers, marker_byte}
+use pkg.cli.color.{Colors, colors}
+
+pub struct Encoder:
+    w: *mut StringBuilder
+    size: usize = 0
+    tab: bool
+    indent: i64
+    depth: i64 = 0
+    colors: *mut Colors = colors()
+    to_err: bool = false
+
+pub fn new_encoder(tab: bool, indent: i64) -> *mut Encoder:
+    box(Encoder { w: StringBuilder::new(), tab: tab, indent: indent, colors: colors() })
+
+## Writes text to stdout, or stderr when to_err.
+pub fn write_stream(to_err: bool, text: string) -> void $ Console:
+    if to_err:
+        _ := $.use(Console).write_error_sync(text)
+    else:
+        _ := $.use(Console).write_sync(text)
+
+fn has_markers(s: string) -> bool:
+    if !may_have_markers(s):
+        return false
+    for c in s.chars():
+        if marker_byte(c).is_some():
+            return true
+    false
+
+## Writes a Go string as its bytes: invalid bytes as they are. hd's console
+## writes text only (hd-lang #2410), so such a string goes through the file
+## API to /dev/stdout or /dev/stderr, in order with the console writes.
+pub fn write_raw!(to_err: bool, text: string) -> void $ Console + FsWrite:
+    if !has_markers(text):
+        write_stream(to_err, text)
+        return
+    path := if to_err: "/dev/stderr" else: "/dev/stdout"
+    match write_bytes!(Path(path), go_bytes(text)):
+        .Ok(_) => pass
+        .Err(_) => write_stream(to_err, display(text))
+
+impl Encoder:
+    fn flush(&mut self) -> void $ Console:
+        write_stream(self.to_err, self.w.build())
+        self.size = 0
+
+    pub fn marshal(&mut self, v: Value, to_err: bool) -> void $ Console:
+        self.to_err = to_err
+        self.encode(v)
+        self.flush()
+
+    fn put(&mut self, s: string) -> void:
+        self.w.push(s)
+        self.size += s.len()
+
+    fn set_color(&mut self, color: string?) -> void:
+        if !self.colors.no_color:
+            match color:
+                .Some(c) => self.put(c)
+                .None => pass
+
+    fn encode(&mut self, v: Value) -> void $ Console:
+        match v:
+            .Null => self.write("null", self.colors.null)
+            .Bool(b) =>
+                if b:
+                    self.write("true", self.colors.true_)
+                else:
+                    self.write("false", self.colors.false_)
+            .Int(i) => self.write("$i", self.colors.number)
+            .Float(f) => self.encode_float64(f)
+            .Big(b) => self.write(bigint.to_string(b), self.colors.number)
+            .Number(s) => self.write(s, self.colors.number)
+            .Str(s) => self.encode_string(s, self.colors.str)
+            .Arr(a) => self.encode_array(a)
+            .Obj(m) => self.encode_object(m)
+            .Hole => panic("invalid type: struct {} ({})")
+        if self.size > 8 * 1024:
+            self.flush()
+
+    ## ref: floatEncoder in encoding/json
+    fn encode_float64(&mut self, f: f64) -> void:
+        if f.is_nan():
+            self.write("null", self.colors.null)
+            return
+        sb := StringBuilder::new()
+        encode_float64(sb, f)
+        self.write(sb.build(), self.colors.number)
+
+    ## ref: encodeState#string in encoding/json
+    fn encode_string(&mut self, s: string, color: string?) -> void:
+        self.set_color(color)
+        self.put("\"")
+        let start = 0usize
+        let i = 0usize
+        let bytes: List[u8] = s.bytes().collect()
+        while i < bytes.len():
+            b := bytes[i]
+            if b < 0x80:
+                if 0x20 <= b && b <= 0x7e && b != 0x22 && b != 0x5c:
+                    i += 1
+                    continue
+                if start < i:
+                    self.put(s.slice(start, i))
+                match b:
+                    0x22 => self.put("\\\"")
+                    0x5c => self.put("\\\\")
+                    0x08 => self.put("\\b")
+                    0x0c => self.put("\\f")
+                    0x0a => self.put("\\n")
+                    0x0d => self.put("\\r")
+                    0x09 => self.put("\\t")
+                    _ =>
+                        hex := "0123456789abcdef"
+                        self.put("\\u00")
+                        self.put(hex.slice(usize(b >> 4), usize(b >> 4) + 1))
+                        self.put(hex.slice(usize(b & 0xF), usize(b & 0xF) + 1))
+                i += 1
+                start = i
+                continue
+            if b == 0xF4 && is_marker_at(bytes, i):
+                # an invalid byte of the Go string (see goshim/encoding.hd)
+                if start < i:
+                    self.put(s.slice(start, i))
+                self.put("\\ufffd")
+                i += 4
+                start = i
+                continue
+            i += 1
+        if start < bytes.len():
+            self.put(s.slice(start, bytes.len()))
+        self.put("\"")
+        if color.is_some():
+            self.set_color(self.colors.reset)
+
+    fn encode_array(&mut self, a: *mut ArrBox) -> void $ Console:
+        self.write("[", self.colors.array)
+        self.depth += self.indent
+        for (i, v) in a.items.iter().enumerate():
+            if i > 0:
+                self.write(",", self.colors.array)
+            if self.indent >= 0:
+                self.write_indent()
+            self.encode(v)
+        self.depth -= self.indent
+        if !a.items.is_empty() && self.indent >= 0:
+            self.write_indent()
+        self.write("]", self.colors.array)
+
+    fn encode_object(&mut self, m: *mut ObjBox) -> void $ Console:
+        self.write("{", self.colors.object)
+        self.depth += self.indent
+        for (i, k) in sorted_keys(m.fields).iter().enumerate():
+            if i > 0:
+                self.write(",", self.colors.object)
+            if self.indent >= 0:
+                self.write_indent()
+            self.encode_string(k, self.colors.object_key)
+            self.write(":", self.colors.object)
+            if self.indent >= 0:
+                self.put(" ")
+            self.encode(m.fields[k])
+        self.depth -= self.indent
+        if !m.fields.is_empty() && self.indent >= 0:
+            self.write_indent()
+        self.write("}", self.colors.object)
+
+    fn write_indent(&mut self) -> void:
+        self.put("\n")
+        if self.depth > 0:
+            self.put((if self.tab: "\t" else: " ").repeat(usize(self.depth)))
+
+    fn write(&mut self, s: string, color: string?) -> void:
+        match color:
+            .None => self.put(s)
+            .Some(_) =>
+                self.set_color(color)
+                self.put(s)
+                self.set_color(self.colors.reset)

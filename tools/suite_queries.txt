@@ -1,0 +1,697 @@
+.
+
+. # comment
+# comment
+1, # 2, # \comment\\3
+0, 128, 01000, 3.14, 1.2e3, 1E+3, 1E-9
+0..[empty]
+" Hello, world! \r\n\t\f\b\"\\\/\uff10 "
+"\n", "\n"
+"\ud83d\ude04" | length, utf8bytelength, explode[]
+. + "foo
+"foo\,bar"
+"\u"
+"\u
+"\
+"\"
+"\u````"
+"\uAA\uAA"
+"\uAA@AA"
+"\uAAGA"
+"\ufffg"
+"0\u00:00"
+"0\u0000\u000/0"
+"\(1) \x "
+"\a"
+"\u\(
+.foo
+.and,.or,.try
+.["foo"]
+."foo", ."2\(.foo[])3"
+.c[.a + .b]
+.d[.a][.b][.c]
+.c[][.a[] + .b[]]
+.c[]."\(.a[])"
+{ message: .[].message }
+.[.a + .b]
+.[null]
+. a
+.foo.bar
+"a"+"☆"*100 | .foo
+.foo|.bar
+.[]|.foo|.bar
+.foo.bar.baz
+.foo?.bar?.baz?
+.foo.bar.baz?
+.[].foo?
+.foo??, .
+1? | .foo
+(1,2)? | .foo
+.[-4,-3,-2,-1,0,1,2,3,nan]
+[.[-4,-3,-2,-1,0,1,2,3:]], [.[:-4,-3,-2,-1,0,1,2,3]], [.[-1,0,1,2,3:-1,0,1,2,3]]
+[.[-2.8,-1.2,0.3,1.7,2.2]], [.[0.3,1.7:]], [.[:0.3,1.7]], [.[0.3,1.7,2.2:0.3,1.7,2.2]]
+.[-1.5:], .[-0.5:], .[-2.5:-1.5], (.[-1.5:] = ["x"]), del(.[-1.5:]), .[1:-0.5], (.[:-0.5] = ["x"]), del(.[:-0.5]), .[:-1.0], .[:0.0]
+.[0] as $a | .[1][] as $i | [$a[:$i], $a[$i:]]
+.[1e300,-1e300], .[-1e300,1e300:], .[:-1e300,1e300], .[-1e300:1e300], .[1e300:-1e300]
+. as $x | 4722366482869645213696 as $y | $x[$y,-$y], $x[-$y,$y:], $x[:-$y,$y], $x[-$y:$y], $x[$y-$y], $x[$y/$y]
+.[infinite,-infinite], .[-infinite,infinite:], .[:-infinite,infinite], .[-infinite:infinite], .[infinite:-infinite]
+.[nan:], .[:nan], .[1:nan], .[nan:nan], (.[1:nan] = ["x"]), del(.[1:nan])
+.[nan:], .[:nan], .[1:nan], .[nan:nan]
+[.[{"start": (null,range(-3;4)), "end": (null,range(-3;4))}]]
+.[{"start": 1, "end": 2}]
+.[{"start": 1}]
+[.[.[]],.[.[]:],.[:.[]],.[.[]:.[]],.[-.[]],.[--.[]]]
+.c[][.a[] : .b[]]
+.[0:1]
+.[0]
+.[[1],[5,7,9],[],5,[3]]
+.[true]
+1 - -1[1:]
+.[1[0]]
+.[[]:0]
+.[0:{}]
+.[-5,-1,0,3,4,6]
+.[3:], .[:3], .[2:4], .[-4:-2], .[1.5:3.5]
+.[-1.5:], .[-0.5:], .[-2.5:-1.5], .[1:-0.5]
+.[[]:]
+.[:{}]
+.,[3,[[2]]],[1],[[.],3]|[.,.]
+.foo | .[] | .
+.[]?
+.x[]?
+.[][]
+.[][]?
+.[]
+[.[].name?]
+.foo | .bar
+.[] | null
+.[] | true, false
+.[] | empty, empty, . + [empty,.][], [empty,.][] / 1, empty < ., . and empty, empty or .
+[empty], [0, empty, 1]
+def f: 1,empty,empty,2; f,f
+map(-.[]), map(+.[])
+(-.)
+[-1 as $x | 1, $x]
+., -. | type
+1 + 2 as $x | -$x
+true // 1 as $x | [$x]
+{ foo: .foo.bar, "bar": .foo, "": false }
+{foo,"bar",qux,quxx:.foo}
+{foo,bar,}
+{as, and, null, module}
+{foo: 1, foo: 2, bar: 3}, {foo, bar, foo: length}
+{"bar": {"baz":.} | select(.baz)}
+{x:-1}, {x:-.}, {x:-.|abs}
+{x: 1 + 2, y: false or true, z: null // 3}
+{x: if true then -. end}
+{}
+{ x: -128, y: +128 }
+{ foo: .foo[], bar: .bar[] }
+{ (.[]): .. }
+{ (.[] + .[]): (.[] + .[]) }
+.[] | { (.k): .a.b }
+. as [$x, $y, $z] | {$x: 1, $y: 2, $z: 3}
+{ (.foo|.bar): .foo.bar }
+{ (.foo): .foo }
+{if:0,and:1,or:2,then:3,else:4,elif:5,end:6,as:7,def:8,reduce:9,foreach:10,try:11,catch:12,label:13,import:14,include:15,module:16}
+[.foo, ., false]
+[]
+[.foo|.bar]
+[.foo|.bar[][]]
+[ .[] | .foo ]
+.[] | .foo | null
+[.[],..,.[]]
+..
+.[] | ..
+.. | .foo?
+{ foo: .. }
+abs
+(-9223372036854775807 - 1) | abs
+length
+(-9223372036854775807 - 1) | length
+keys
+utf8bytelength
+has(.c[])
+has(2, nan, infinite, -infinite)
+has
+has(1; 2)
+has(0)
+in({"foo": 42})
+in([3, 4])
+in(null)
+in([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0])
+map(..)
+to_entries
+from_entries
+with_entries(.key |= "x" + . | .value += 1)
+add
+. as $x | [$x, {y:1}] | add, $x
+[.[:2], [0], .[1:]] | add
+add(.), add(empty), add(1,2,3), add(range(10))
+add(.[])
+.y = add(.x[])
+flatten
+flatten, flatten("")
+flatten(0, 1.5, 2)
+flatten(-1)
+flatten(nan)
+[min, min_by(.[1]), min_by(.[2]), max, max_by(.[1]), max_by(.[2])]
+sort, sort_by(.a), sort_by(.b), sort_by(.b, .c), group_by(.b), group_by(.c, .a), group_by(.a + .b - .c == 2)
+unique, unique_by(length)
+try min catch ., try max catch ., try sort catch ., try unique catch .
+map(arrays), map(objects), map(iterables), map(booleans), map(numbers), map(strings), map(nulls), map(values), map(scalars)
+recurse
+recurse(.a[])
+[recurse(. + .; . < 1000)]
+[while(.[0]<100; [.[1], .[0]+.[1]]) | .[0]]
+[.,1] | until(.[0]==0; [.[0]-1, .[0]*.[1]]) | .[1]
+[limit(.; repeat(1,2,3))]
+[range(.)], [range(range(.))], [range(3.5)], [range(3; 5)], [range(1.5; 4)], [range(-5; -1.5)], [range(3.5; 5.5)], [range(-5.5; -3.5)], [range(0; 10; 3)], [range(0; 10; -1)], [range(5; -5; -3)], [range(0.25; 9.5; 2.25)], [range(-5; -9.5; -1)]
+range(9223372036854775700; 9223372036854775805; 10)
+range(0; 20000000000000000000; 2000000000000000000)
+[range(-.; .+1)] | [range(.[]; .[]; .[])] | recurse(.[26:];.[0])[:26] | map(.+3)
+(null, "", [], {} | try range(.) catch .), try range(""; 0) catch ., try range(0; 1; []) catch .
+toboolean
+try toboolean catch .
+tonumber
+try tonumber catch .
+tostring
+type
+reverse
+.[] as $x | (null,false,true,[],[3,4],[3,1],"foo","ll",{},{"a":1},{"a":""},{"b":[5]},{"a":3,"b":[5]}) as $y | $x | [$x,$y,contains($y)]?
+. as $x | ("@", "\u0000@", "\u0000dc", "b\u0000c", "b\u0000cd", "b\u0000cd") as $y | $x | [$x,$y,contains($y)]
+nan | contains([nan])
+indices(0), index(0), rindex(0)
+[indices(0, 1, [1, 2, 1])], [index(0, 1, [1, 2])], [rindex(0, 1, [1, 2])]
+[indices("", ",", "x")], [index("", ",", "x")], [rindex("", ",", "x")]
+[indices("０", "１", "３４")], [index("０", "１", "３４")], [rindex("０", "１", "３４")]
+(try indices([]) catch .), (try index([]) catch .), (try rindex([]) catch .)
+.[] as $x | (false,"abc",[],["foobaz","foobar"],{},{"a":10,"b":20,"c":30}) as $y | $x | [$x,$y,inside($y)]?
+startswith("foo")
+("x" | try startswith({}) catch .), (10 | try startswith("x") catch .)
+endswith("foo")
+("x" | try endswith({}) catch .), (10 | try endswith("x") catch .)
+[combinations]
+[combinations(3)]
+ltrimstr("foo")
+("x" | try ltrimstr({}) catch .), (10 | try ltrimstr("x") catch .)
+rtrimstr("foo")
+("x" | try rtrimstr({}) catch .), (10 | try rtrimstr("x") catch .)
+trimstr("foo")
+("x" | try trimstr({}) catch .), (10 | try trimstr("x") catch .)
+ltrim
+try ltrim catch .
+rtrim
+try rtrim catch .
+trim
+try trim catch .
+explode
+implode
+try implode catch .
+split(", ","") | join("/")
+.[] as $t | .[] as $s | $s | split($t)
+try split(",") catch ., try split(1) catch .
+join(",")
+. / "" | join(.[])
+try join(",") catch .
+.[] | try join(",") catch .
+join(null)
+.[] | try join(1) catch .
+ascii_downcase
+ascii_upcase
+walk(if type == "boolean" then not else . + . end) | .[]
+walk(.,0)
+transpose
+abc
+$abc
+map(.;.)
+def f(g): g | g; f(..)
+def f: def g: .; g; f
+def f: .,.; def g: [f,f]; f,g
+def f: def f($x): .; f(.x) | .x; f += f
+def f(g): if type == "array" then map(f(g * 2)) else g end; f(.)
+def f(g): if . < 1000 then .,(g|f(g|g)) else g end; f(.*2)
+def f: . as $x | $x, ($x + 1 | f); last(limit(100000; f))
+def f: . as $x | $x, (if $x < 3 then $x + 1 | f else empty end), $x; f
+def f: ., if . < 2 then . + (1,2) | f else empty end; f
+100000 as $x | def f: if . == $x then . else . + 1 | f end; f
+def f: if .a then .a | f end; {}, {a:{}} | f | .,0
+def f(g): def f: def g: 3; g * 2; g * f; def f: . * 5; f(f)
+(def f(g): def g: 1; g; f(2)), (def g: 3; def f(g): g; f(4))
+def f(g;g): g; f(1;2)
+def f($g;$g): $g; f(1;2,3)
+def empty: . % 2; range(5) | select(empty > 0)
+def select(f): f; null, 0 | numbers, select(.)
+def update: .[1:]; [range(3)] | while(length>0; update)
+def f($keys): with_entries(.key *= $keys); {x: 1} | f(3)
+def f0( a; b; c):  a*100 +  b*10 +  c; def f1( a;$b; c):  a*100 + $b*10 +  c; def f2($a; b;$c): $a*100 +  b*10 + $c; def f3($a;$b;$c): $a*100 + $b*10 + $c; [f0(.[];.[];.[])], [f1(.[];.[];.[])], [f2(.[];.[];.[])], [f3(.[];.[];.[])]
+def f($x; $y): [$x, x, $y, y]; f(1,2; 3,4)
+[0, def f: 1, def g: 2; g, 3 as $x | def h: $x + 1; h * g; f, f + 1, 5]
+def f(g): g | g; f
+def $f: .; $f
+def f: 0;
+[.[] + .[]], [.[] - .[]], [.[] * .[]], [.[] / .[]], [.[] % .[]]
+[.[] + .[]], [.[] - .[]], [.[] * .[]], [.[] / .[]], [.[]  % .[]]
+[.[] + .[] % .[] * .[] - .[] / .[] % .[] + .[]] | while(length>0; .[32:])[:32]
+(-9223372036854775807-1) | -., .*-1, -1*., ./-1, .%-1
+72 / (1, -2, 3, -4, 6, -8) * 100000000000000000000
+1?/1
+.?/
+def fact($n): if $n < 1 then 1 else $n * fact($n - 1) end; (range(30;51) | "\(.)! = \(fact(.))"), fact(50) / fact(30), fact(50) % (fact(30) + 1), fact(100), fact(1000)*1.0, 1/fact(1000), -1/fact(1000), 1.0/fact(1000)
+def f($n): if $n < 1 then 1 else (-$n) * (-f($n - 1)) end; -f(range(30;40))
+.[] as $x | .[] as $y | [$x, $y, try ($x / $y) catch .]
+.[] as $x | .[] as $y | [$x, $y, try ($x % $y) catch .]
+1 % 0.9
+(1, nan) % (1, nan) | isnan
+[try (.[] / .[]) catch .], [try (.[] % .[]) catch .]
+.[] + .[] + "c"
+3 * .[], 2.5 * .[], .054e2 * .[]
+(-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 3.7, 10, nan) * "abc"
+(infinite, 1e300, 720000000) as $n | try ($n * "abc") catch .
+(-9223372036854775808, -1, 0, 0.001, 0.999, 1, 7, 9223372036854775807, 1e300) * ""
+.[0] + .[]
+.[] * .[]
+.[] / .[]
+.[] + .[] - .[]
+. as $v | .[:0] + [6, 7, 8] | ., $v
+. as $v | . - [2, 3] | ., $v
+[1,2,3,4,1,4722366482869645213696] - [.,3,4722366482869645213696]
+. as $x | [$x-$x] - [0]
+[nan,{x:nan}] - [nan,{x:nan}]
+.[] + .[]
+.[] - .[]
+[.[] > .[], .[] < .[], .[] >= .[], .[] <= .[], .[] == .[], .[] != .[]] | while(length>0; .[120:]) | .[:120] | map(if . then 1 else 0 end) | join("")
+[.[] + .[] > .[] - .[], .[] * .[] < .[] / .[] + .[] / .[], .[] == .[] * .[]] | while(length>0; .[120:]) | .[:120] | map(if . then 1 else 0 end) | join("")
+. == . == .
+[.[] > .[] and .[] or .[] < .[]] | while(length>0; .[120:]) | .[:120] | map(if . then 1 else 0 end) | join("")
+[.a // .b, .b // null // .a, .c[] // .d[], .d[] // .c, .c // .a, .e.a // .c[]]
+.a ?// 1
+if . then . else [.] end
+if . == null then . elif not then [.] elif . == true then [[.]] else [[[.]]] end
+map(if . > 2 then . / 2 end)
+. + if 1 then 2 else 3 end + 4
+[-if true then -. end]
+if . then tonumber end ?
+if 0 then . else 0|0 end
+if 0 then 0|0 else . end
+if true then [.] end []
+not
+if .. then [] else {} end
+map(try utf8bytelength)
+map(try utf8bytelength catch .)
+def f: fromjson; try ({} | f) catch ., 1
+1, try error(2), 3
+try error(0) // 1
+try error(0) = 1
+try 0 * error(0)
+try 0 .[error(0)]
+1 + try 2 catch 3 + 4
+[-try .]
+[range(.)] | reduce .[] as $i (0; . + $i)
+reduce .[] as [$i,$j] (0; . + $i * $j)
+reduce .[] as {$i, j:$j} (0; . + $i - $j)
+reduce .[] as [$i,$j] ?// {$i,$j} (0; . + $i * $j)
+reduce .[] as [$a] ?// {$b} ?// $c ([]; . + [[$a, $b, $c]])
+reduce .[] as [$a] ?// $a ([]; . + [if $a == 2 then error else $a end])
+reduce . as $n (.; .)
+. + reduce . as $n (. + [2]; [.]) + .
+[-reduce -.[] as $i (0; . + $i)]
+reduce .[] / .[] as $i (0; . + $i)
+reduce range(5) as $x (0; . + $x | select($x != 2))
+reduce (1,2) as $i (.; (.[0], .[.[0]]) = $i), reduce (1,2) as $i (.; (.[0], .[.[0]]) |= $i)
+reduce range(5) as $x (range(3); . + $x)
+reduce .[] as $x (0; . + $x) as $x | $x
+. as $x | reduce .[] as $x (.; . + .) | [., $x]
+foreach range(5) as $item (0; $item)
+foreach .[] as [$i, $j] (0; . + $i - $j)
+foreach .[] as {a:$a} (0; . + $a; -.)
+foreach .[] as [$i,$j] ?// {$i,$j} (0; . + $i * $j)
+foreach .[] as [$a] ?// {$b} ?// $c (null; [$a, $b, $c])
+foreach .[] as {$a} ?// [$a] ?// $a (null; $a; if 1 < . and . < 4 then error else . end)
+foreach .[] as $i (1; ., . + $i, range(.))
+foreach range(5) as $i (0; . + $i | select($i != 2); [$i, .])
+foreach range(3) as $i (range(3); . + $i; [$i, .])
+[-foreach -.[] as $i (0; . + $i)]
+[foreach .[] / .[] as $i (0; . + $i)]
+[foreach .[] as $x (0; . + $x) as $x | $x]
+. as $x | foreach .[] as $x (.; . + .) | [., $x]
+[(label $x | .[] | if . > 2 then break $x else . end), 0]
+[range(.)] | label $x | foreach .[] as $i (0; if . > 5 then break $x else . + $i end)
+label $x | (label $y | try break $y catch .), .
+range(.) | label $out | limit(3; 1, if . > 1 then break $out end, 2)
+label $out | last(foreach range(0; 10) as $i ({x: 1}; if .x > 10 then break $out else .x += 1 end))
+def f: label $x | if . < 5 then ., (. + 1 | f, break $x, .) else . end; f
+label $x | (label $x | break $x), .
+label foo | .
+break $test
+(label $x | 1) | break $x
+label $x | break x
+label $x | break
+. as $x | (label $x | break $x), $x
+["\(.foo[])_\(.bar[])_\(.baz[])"]
+[{a:"\(.foo[])"}, {"\(.foo[])": 1}, {"\(.bar[])"}]
+" \("(") \("x" + "\(1 + 2)") \("\\") \("\("\\")") \(")") "
+"\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\("\(1+2)")")")")")")")")")")")")")")")")")")")")")")")"
+"\(1 +)"
+tojson
+fromjson
+.foo.bar as $foo | .foo.bar as $bar | {$foo} + {bar: ($bar / 2)} * { baz: 20 }
+.ys as $ys | .xs[] | {a, b: $ys[.b]}
+.foo as foo | {$bar}
+.foo as $foo | {$bar}
+. as [$i, $j] | [$j, $i]
+. as [$i, [$j], [[$k]]] | [$i, $j, $k]
+. as {$foo, bar: $bar} | {$bar, $foo}
+. as {$foo, bar: {"baz": {$qux}, "": $quy}} | {$foo, $qux, $quy}
+. as {as: $foo, ("e"+"x"+"p"): $bar, (.foo): $baz, "\(.qux)": $qux} | [$foo, $bar, $baz, $qux]
+. as {$i} | [$i]
+. as {$a, $b: [$c, $d]} | [$a, $b, $c, $d]
+. as $x | (.foo as $x | [$x]) | .+[$x]
+. as $x | [.foo as $x | $x] | $x
+. as $x | {bar: (.foo as $x | $x)} | $x
+. as $x | {(.foo as $x | $x): $x}
+. as $x | if (.foo,.bar) as $x | $x then 1 as $x | $x else 2 as $x | $x end | [., $x]
+[range(.)] | 3 as $x | reduce .[] as $i (.[5] as $x | $x; . + $x + $i)
+[2 as $x | foreach range(.) as $item (. as $x | $x; . + $item * $x; . + $x)]
+(. as $i | $i) | $i
+[. as $i | $i] | $i
+{x: (. as $i | $i)} | $i
+{(. as $i | $i): $i}
+"x" as $v | def f: $v; "y" as $v | [., f, $v]
+def f: 1; . | (def f: 2; f) | f, .
+def f: 1; . | [def f: 2; f] | f, .
+def f: 1; . | {bar: (def f: .foo; f)} | f, .
+def f: 1; . | {(def f: "foo"; f): f}
+(def f: 1; f) | f
+[def f: 1; f] | f
+{x: (def f: 1; f)} | f
+{(def f: 1; f): f}
+[first, last, nth(-6,-5,-1,0,2,5)]
+[first(.[]), last(.[]), nth(0,3,5;.[]), nth(9;range(infinite))]
+[first(.[]), last(.[]), nth(0;.[])]
+first(.), first(.?), first(.,.), first(.?,.), first(.,.?), first(.?,.?)
+first((null, null) | first(null))
+nth(-1;.[])
+nth(range(3); range(infinite))
+nth(1; 0,1,error)
+first(range(1; 200) | . as $x | select(all(range(1; 7); $x % . == 0)))
+[limit(0,3,13; range(infinite))]
+limit(-1; range(3))
+[skip(0,3,5,7; range(5))]
+skip(-1; range(3))
+[all, any]
+[all(not), any(not)]
+[all(range(.); not), any(range(.); not)]
+[isempty(empty), isempty(range(infinite)), isempty(1,error("foo"))]
+isempty(isempty(empty))
+isempty(first(null))
+map(sin), map(cos), map(tan) | map(. * 1000000000 | floor / 1000000000)
+map(asin), map(acos), map(atan) | map(. * 1000000000 | floor / 1000000000)
+map(sinh), map(cosh), map(tanh) | map(. * 1000000000 | floor / 1000000000)
+map(asinh), map(acosh), map(atanh) | map(. * 1000000000 | floor / 1000000000)
+map(floor), map(ceil), map(trunc), map(fabs)
+[floor, ceil, sqrt, exp10]
+map(round), map(nearbyint), map(rint)
+map(sqrt), map(cbrt) | map(. * 1000000000 | floor / 1000000000)
+map(significand)
+map(exp), map(exp10), map(exp2), map(expm1) | map(. * 1000000000 | floor / 1000000000)
+map(frexp), map(modf)
+infinite, -infinite | modf
+map(log), map(log10), map(log1p), map(log2), map(logb) | map(. * 1000000000 | floor / 1000000000)
+map(gamma), map(tgamma), map(lgamma) | map(. * 1000000000 | floor / 1000000000)
+map(erf), map(erfc), map(j0), map(j1), map(y0), map(y1) | map(. * 1000000000 | floor / 1000000000)
+[fdim(0.25,0.625; 0.125,0.375)], [fmax(0.1,0.3; 0.2,0.4)], [fmin(0.1,0.3; 0.2,0.4)]
+[fdim(1,nan; 1,nan)], [fmax(1,nan; 1,nan)], [fmin(1,nan; 1,nan)]
+[copysign(0,0.5,-1.5; 0,1,-3.5)], [drem(0.5,-0.75,1.125; 0.5,-0.25)], [fmod(0.5,-0.75,1.125; 0.5,-0.25)], [remainder(0.5,-0.75,1.125; 0.5,-0.25)]
+[nextafter(0,0.5,-0.75; 0.5,-0.25)], [nexttoward(0,0.5,-0.75; 0.5,-0.25)]
+[atan2(0,1; 0,1,-3)], [hypot(0,-3.75,12; 0,5,-16)] | map(. * 1000000000 | floor / 1000000000)
+[ldexp(0,0.5,2; 0,0.5,-2,3,10)], [scalb(0,0.5,2; 0,0.5,-2,3,10)], [scalbln(0,0.5,2; 0,0.5,-2,3,10)]
+[jn(0,0.5,2; 0,0.5,-2,3,10)], [pow(0,0.5,2; 0,0.5,-2,3,10)], [yn(0,0.5,2; 0.5,-2,3,10)] | map(. * 1000000000 | floor / 1000000000)
+[jn(1e19,-1e19; 1)], [jn(1e9,100000001,-100000001; 1,-1)]
+[jn(155,156,157,-156,-157; 1,-1)], [jn(253,254; 10)], [jn(156; 0.99,-0.99), jn(157; 1.03,-1.03), jn(101; 0.048), jn(142; 0.563)]
+[yn(1e19,-1e19; 1), yn(2147483647; 1e9), yn(-2147483647,-2147483646; 1)]
+[yn(151,152,-151,-152,-153; 1), yn(246,247; 10), yn(119; 0.22), yn(134; 0.484)] | map(if isinfinite then . elif . < 0 then "-finite" else "+finite" end)
+[fma(1.5,2.5; 3.5,4.5; 5.25,6.75)]
+[infinite, -infinite] | (.[], .[]+.[], .[]-.[], .[]*.[], .[]/.[], .[]%.[]%256, 1/.[], -1/.[], .[]-1e300, .[]+1e300) | [., . == infinite, . == -infinite, contains(infinite)]
+infinite | ., -., 1/., 1/(-.), nan, null, "", {}, [] | [., isfinite, isinfinite]
+nan, infinite, -infinite | ., -., 1/. | finites
+nan, infinite-infinite, infinite/infinite, 0, null | [., .+1, isnan]
+[null, true, false, "", [], {} | isnan]
+nan | [.<., .>., .<0, .>0, .==., .!=.], ([., 1, ., 2, .] | [min, max], sort, group_by(.))
+0, 2.2250738585072011e-308, 2.2250738585072014e-308, 1, 1.7976931348623157e+308, nan, infinite, "", [], {} | isnormal
+0, 2.2250738585072011e-308, 2.2250738585072014e-308, 1, 1.7976931348623157e+308, nan, infinite | ., -. | normals
+0, 2.2250738585072014e-308, 1.7976931348623157e+308, nan, infinite | nextafter(.; 0, infinite) | normals
+nan, infinite, -infinite | [., tostring]
+[truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]])]
+fromstream(range(5) | truncate_stream({x:[1,{y:[2]},3],z:[4]} | tostream))
+tostream
+setpath([["a","b",0,1,2],[1,2,"a","b"]][]; 1,2)
+setpath(["a","b",0,1]; 1,2)
+setpath(-2,0,2 | [.]; 4,5)
+setpath([]; 10)
+setpath([-1]; 10)
+setpath(["a","b","c"]; 10)
+setpath(["a",1]; 10)
+setpath([{}]; 10)
+setpath([{start:0}]; 10)
+setpath([[]]; 10)
+setpath([{start:0,end:1}]; 10)
+setpath([{start:"x",end:2}]; [9])
+delpaths([["a",1,"b",1]])
+delpaths([[2],[6],[4]])
+delpaths([["a","b","c"]])
+delpaths([[2],[-10],[10],[-3]])
+delpaths([["x"],["x",0,"y"]], [["x",0],["x",0,"y"]], [["x"],["x",{"start":0}]])
+delpaths([["a","b"],["a"]]), delpaths([["a","b","c"],["a","b"],["a","d"]]), delpaths([["c",0,"x"],["c",0.0]]), delpaths([["c",{"start":0,"end":1},0,"x"],["c",{"start":0,"end":1}]]), delpaths([["a","b"],["c"],[]]), .
+delpaths([[-1,0],[0,0],[0,2]]), delpaths([[0,-3],[0.5,0],[-1,{"start":1,"end":null},1]])
+delpaths([["a"]]), delpaths([["a","b"]]), delpaths([[0]]), delpaths([[-1]]), delpaths([[{start:1,end:2}]])
+delpaths([{}])
+delpaths([["x"]])
+delpaths([[{"start":1,"end":{}}]])
+delpaths([["a","b"],["c"]])
+delpaths([[0],[-1,"x"]])
+getpath(["a",1,"b",2])
+getpath([])
+[getpath([{"start":1,"end":3}]), getpath([{"start":-2,"end":null}]), getpath([1]), getpath([])]
+getpath(["a",{"start":0,"end":2}]), getpath(["a",1])
+[getpath(path(.[1:3])), getpath(path(.[1]))]
+. as $d | [path(.a[0:2]), path(.b[1])] | map(. as $p | $d | getpath($p))
+getpath(["k"])
+getpath(["a",1,"b","c"])
+["foo",1] as $p | getpath($p), setpath($p; 2), delpaths([$p]), .
+.[] | try (getpath(["a",0,"b"]) |= 5) catch .
+pick(.x, .y[2], .y[0], .z)
+map_values(.*2)
+map_values(tonumber? // .)
+del(.), del(empty), del((.foo,.bar,.baz) | .[2,3,0]), del(.foo[0], .bar[0], .foo, .baz.bar[0].x), del(.foo[1:][:3][1:], .bar[:2][1:])
+del(.[1], .[-6], .[2], .[-3:9])
+[range(.)] | (5,7) as $x | del(.[] | select(. % $x == 0)) | add
+[range(.)] | del(.[range(length) | {start:.,end:(.+1)}])
+del(.a), del(.a.b), del(.[0]), del(.[-1]), del(.[1:2])
+.foo.bar = 1
+.[-1,0] = 3
+. = 1
+.foo = 1
+(.foo,.bar,.baz) = 1
+.[2:4] = ([], [0], [4,3,2]), .[1:-1] = [3,2], .[2:0] = [.[]], .[10:] = [1], .[-20:-10] = [1], .[0:5] = [9], .[1:][1:] = [9], .[1:][:3] = [6,7,8], .[:4][1:][:3] = [9], .[1:][1:-2] = [9], .[:4][-3:][:5] = [9], (null | .[:1][2:] = [9])
+.foo.[0].bar.[1] = 1
+.[2][2] = 1
+.[2].foo = 1
+.foo[2].bar = 2
+(.foo).bar = 1
+.foo[].bar = 1
+[(.x,.x.y,.x.y.z) = {}, (.x.y.z,.x.y,.x) = {}]
+.foo = .bar
+(.foo,.bar,.baz) = .bar[]
+.. = ..
+..[:0] = ..
+.[-1,0] = 1
+.[999999999] = 1
+(.[] | select(.k == "b") | .v) = 0
+[range(3)] | .[] = 0 | [.[] = 1, .[] = 2]
+[range(.)] | .[] = 1 | add
+[range(.)] | (.[] | select(. % 2 > 0)) = 1 | add
+[range(.)] | .[range(length)] = 1 | add
+[range(.)] | .[range(length) | {start:.,end:(.+1)}] = [1] | add
+[{key:range(.)|tostring}] | from_entries | .[] = 1 | add
+.[range(50000)] = 1 | add
+.foo |= .+1
+.[0].a |= {"old":., "new":(.+1)}
+def inc(x): x |= .+1; inc(.[].a)
+.foo |= empty
+.foo |= repeat(.)
+(.foo,.foo,.foo) |= .+1
+(.[] | select(. % 2 > 0)) |= empty
+[range(.)] | .[] |= if . % 2 == 0 then empty else [., -.] end
+[range(3)] | .[] |= 0 | [.[] |= 1, .[] |= 2]
+[range(.)] | .[] |= . * 2 | add
+[range(.)] | (.[] | select(. % 2 > 0)) |= (. * 2) | add
+[range(.) | {key:tostring,value:.}] | from_entries | .[] |= . * 2 | add
+(.[1:3][],.[2:4][],.[2]) |= .+1
+(.a.b,.a,.a.p.z) |= {p: ., q: .}
+(.a.b.c,.a,.a.p.b.z) |= {p: ., q: .}
+(.[0], .[1:2]) |= (if type == "array" then [.] else 10 end) | .[1][0] | type
+(.a[0], .a[1:3]) |= (if type == "array" then [{x: .}, 0] else 10 end)
+.foo |= .?
+[range(.)] | .[] |= range(infinite)
+. |= try . catch .
+.foo |= (fromjson? // "x")
+.[] += 2, .[] -= 2, .[] *= 2, .[] /= 2, .[] %= 2
+.foo += .foo, .bar //= .foo, .[] /= .foo, .[] = .foo
+. += 1 -= 2
+.foo[] | error
+error
+try error catch .
+null,1,[],{x:42} | try error catch .
+.foo | error("error message")
+try error({ x: 42 }) catch .
+error(null)
+path(.)
+path(.a|.[1,2:3,4].b[5,6])
+[path(.[] | select(. > 3))]
+[path(..)]
+(.a as $x | (.b,.c)) = "b"
+.a[path(.b)[0]]
+path(.[] | select(.id | startswith("x")) | .id)
+[path(getpath([[0]] | .[0],.[]))]
+[nan,{x:nan}] | path(.[1].x)
+path(.a[path(.b[.a:.b])[0]])
+path(. + 1)
+path({}.x)
+path([0][0 + 0])
+path([0][0:1])
+path({} | getpath([]))
+.[:1] as $x | path($x.[0])
+.[:0] as $x | path($x.[0])
+def f($x): .y; path(f(.x))
+path(. = .x)
+[.[]][].a = 1
+{}[] = 10
+paths
+paths(. > 2)
+bsearch(0,1,2,3,4,5,6)
+[{x:range(.),y:range(.)}] | bsearch({x:1,y:1})
+gmtime, localtime | map(. * 1000000 | floor / 1000000)
+(.,mktime | .,strftime("%Y-%m-%dT%H:%M:%SZ"),strflocaltime("%Y-%m-%dT%H:%M:%S%z")), todate
+mktime, strftime("%Y-%m-%dT%H:%M:%S.%fZ"), strflocaltime("%Y-%m-%dT%H:%M:%S.%f%z")
+gmtime | .[5] -= 0.5 | mktime
+[infinite, -infinite, nan, 1e19, -1e19, 9223372036854775807, -9223372036854775808] | .[] | try gmtime catch .
+[[infinite,0,1], [nan,0,1], [1e19,0,1], [0,1e19,1], [2001,0,1,0,0,infinite], [2001,0,1,0,0,nan], [2001,0,1,0,0,1e19], [9223372036854775807,0,1], ["x",0,1]] | .[] | try mktime catch .
+try (infinite | todate) catch ., try ([1e19,0,1] | strftime("%Y")) catch .
+strptime("%Y-%m-%dT%H:%M:%S%z")? // strptime("%Y-%m-%dT%H:%M:%S.%f%z"), fromdate?
+strptime("%Y-%m-%dT%H:%M:%S%z")
+strptime("%c") | strftime("%c")
+now | type
+recurse(debug|.[]?)
+debug("value: \(.)", [.,.])
+recurse(stderr|.[]?)
+builtins | sort[] | select(test("debug|stderr"))
+input_filename
+., inputs, (try input catch .) | input_filename
+builtins[] | select(test("input_filename"))
+def f($n): if $n > 0 then $n, f($n - 1) else halt end; f(.), .
+., halt, .
+halt
+halt_error
+nan | halt_error
+range(5) | try halt_error catch .
+try halt_error catch .
+halt_error(42)
+halt_error(.)
+builtins | length > 100
+env|length > 0
+def f: env; f|length > 0
+builtins[] | select(test("env"))
+[$ENV|length > 0, 1 as $ENV | $ENV]
+env(0)
+input, input
+input + input[0]
+def f: [def f: input; range(3) | f]; f
+range(5) | input
+. + input
+reduce inputs as $x (0; . + $x)
+fromstream(inputs)
+fromstream(1 | truncate_stream(inputs))
+[inputs][]
+inputs[]
+inputs
+[match("bcd")], [match("☆★"; "g")], (("","g","i","ig") as $flag | [match("bcd"; $flag)]), [match("ABC.?D.?E"; "mg")], [match("A(?<bar>B(C)(.?D))(?<foo>.?E)")], [match("b(?<foo>c)(d)"; "igm")], [match("bc(c(.*))?d")]
+match("x"; "g")
+match("x"; "a")
+match("["; "g")
+[test("xyz"), test("bcd"), test("efg"), test("efg"; "i"), test("☆★")]
+capture("bcd"), capture("b(?<foo>c.?(?<bar>d..))"), [capture("(?<a>b(?<foo>c).?(?<bar>d..))"; "gmi")]
+[match(["bcd"])], [match(["bcd", "gi"])], [test(["bcD"]), test(["bcD", "i"]), test(["bcD", null])], capture(["b(?<foo>c)"]), [capture(["(?<foo>b)c", "gi"])]
+scan("abc"), scan("abc"; "i"), scan("(b(c*)(d*))"), scan("(b(c*)(d*))"; "i")
+split("a"), split("a+"), split("a+"; ""), split("a+"; "i"), split(""; "")
+[splits("a")], [splits("a+")], [splits("a+"; "")], [splits("a+"; "i")], [splits(""; "")]
+sub("a"; "b"), sub("aaa"; "b"), sub("a"; "b","c"), sub("a(?<a>.)"; "\(.a)b\(.a)"; "ig"), sub("(?<foo>★)"; "\(.foo)☆\(.foo)"), sub("^"; "b"), sub("a"; empty)
+gsub("a"; "b"), gsub("a.c"; "b"), gsub("a"; "b","c"), gsub("a(?<a>..)"; "\(.a+.a)"; "i"), gsub("(?<foo>★)"; "\(.foo)☆\(.foo)"), gsub("^"; "a"), gsub("a"; empty)
+[match("a*"; "g").offset], [scan("[a-z]*")], gsub("[0-9]*"; "#"), split("-*"; ""), [splits("\\s*")]
+gsub("(?m)^a*"; "#"), gsub("\\ba*"; "#"), gsub("(^|-)a*"; "#"), gsub("[a-z]*\\b"; "#")
+[scan("(x)?a*")], [match("(a|)"; "g") | [.offset, .captures[0].offset]], [scan("[^a]*"; "i")]
+[scan("[☆★]*")], [match("[☆★]*"; "g").offset], gsub("[☆★]*"; "#")
+match("★((.)b)(z)?"; "g") | [.offset, .length, (.captures[] | [.offset, .length])]
+INDEX(range(5); .*2)
+[range(5)] | JOIN(map(.*3); .*2)
+[range(5; 13)|IN(range(0; 10; 3))]
+format("html","uri","csv","tsv","sh","base64")
+format("t")
+@text
+@json
+@json "0\(.)1\(. + .)2\([2])3"
+@html
+@html "x\(.)x\(.+.)x\("<>")x"
+@uri
+@uri "q=\(.)&q=\(. + .)"
+@urid
+@csv
+@csv "\(.),\(. + .),\([nan])"
+@tsv
+@tsv "\(.),\(. + .),\([nan])"
+@sh
+@base64
+@base64 "\(.),\(. + .),\(. + . + .)"
+@base64d
+@foo
+@0
+@foo?, @bar"\(0|debug)"?, 1
+. as {$a} ?// [$a] ?// $a | $a
+. as {$a} ?// [$a] ?// $a | if 1 < $a and $a < 4 then $a|error else $a end
+label $out | . as {$a} ?// [$a] ?// $a | {$a}, break $out
+first((. as {$a} ?// [$a] ?// $a | {$a})?)
+label $out | . as {$a} ?// [$a] ?// $a | {$a}, halt
+. as {$a} ?// [$a] ?// $a | {$a}, halt_error
+try (. as {$a} ?// [$a] ?// $a | {$a}, halt_error)
+.[] as [$a] ?// {$b} ?// $c | [$a, $b, $c]
+. as {$a, b: [$c, {$d}]} ?// [$a, {$b}, $e] ?// $f | [$a, $b, $c, $d, $e, $f]
+. as [$a] ?// $a | $a
+.foo[]
+"foo","bar","b\u0000a\u0000z","qux"
+., null, nan, infinite
+1
+0
+7
+. / 2
+[.]
+[.,.]
+.[] + 1
+8
+10
+testdata/1.jq
+>abc
+.abc[
+[ .[] | { .id } ]
+if 0then. else. end
+.foo & .bar
+foo☆
+\/
+testdata
+include "m"; f
+import "4" as $x; $x
+include "4"; import "6" as bar; bar::g
+include "m2" { search: "testdata/m2" }; g
+module {}; .
+empty
+1,not,2
+halt_error(0)

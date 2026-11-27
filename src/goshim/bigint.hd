@@ -1,0 +1,255 @@
+## A port of the parts of Go's math/big.Int that gojq uses.
+## The magnitude is little-endian in base 1e9; zero has no limbs and is never negative.
+
+BASE := 1000000000u64
+
+@derive(Eq, Debug)
+pub struct BigInt:
+    pub neg: bool
+    pub mag: List[u32]
+
+fn trim(mag: List[u32]) -> List[u32]:
+    let mut m = mag
+    while !m.is_empty() && m[m.len() - 1] == 0:
+        _ := m.pop()
+    m
+
+fn make(neg: bool, mag: List[u32]) -> BigInt:
+    m := trim(mag)
+    BigInt { neg: neg && !m.is_empty(), mag: m }
+
+pub fn from_i64(i: i64) -> BigInt:
+    let neg = i < 0
+    # work in u64 so that i64::MIN negates cleanly
+    let u: u64 = if neg: u64(-(i + 1)) + 1 else: u64(i)
+    let mut mag: List[u32] = []
+    while u > 0:
+        mag.push(u32(u % BASE))
+        u = u / BASE
+    make(neg, mag)
+
+pub fn parse(text: string) -> BigInt?:
+    let s = text
+    let neg = false
+    if s.starts_with("-"):
+        neg = true
+        s = s.slice(1, s.len())
+    else if s.starts_with("+"):
+        s = s.slice(1, s.len())
+    if s.is_empty():
+        return .None
+    for c in s.chars():
+        if c < '0' || c > '9':
+            return .None
+    let mut mag: List[u32] = []
+    let end = s.len()
+    while end > 0:
+        start := if end >= 9: end - 9 else: 0
+        mag.push(s.slice(start, end).parse::[u32]().unwrap_or(0))
+        end = start
+    .Some(make(neg, mag))
+
+pub fn to_string(b: BigInt) -> string:
+    if b.mag.is_empty():
+        return "0"
+    let mut parts: List[string] = []
+    let i = b.mag.len()
+    while i > 0:
+        i -= 1
+        part := "${b.mag[i]}"
+        if i == b.mag.len() - 1:
+            parts.push(part)
+        else:
+            parts.push(part.pad_start(9, '0'))
+    (if b.neg: "-" else: "") + parts.join("")
+
+pub fn to_i64(b: BigInt) -> i64?:
+    if b.mag.len() > 3:
+        return .None
+    let u: u64 = 0
+    let i = b.mag.len()
+    while i > 0:
+        i -= 1
+        match u.checked_mul(BASE):
+            .Some(x) => u = x
+            .None => return .None
+        match u.checked_add(u64(b.mag[i])):
+            .Some(x) => u = x
+            .None => return .None
+    if b.neg:
+        if u <= 9223372036854775807u64:
+            return .Some(-i64(u))
+        if u == 9223372036854775808u64:
+            return .Some(-9223372036854775807i64 - 1)
+        return .None
+    if u <= 9223372036854775807u64:
+        return .Some(i64(u))
+    .None
+
+pub fn to_f64(b: BigInt) -> f64:
+    to_string(b).parse::[f64]().unwrap_or(if b.neg: -1.0 / 0.0 else: 1.0 / 0.0)
+
+fn cmp_mag(a: List[u32], b: List[u32]) -> i32:
+    if a.len() != b.len():
+        return if a.len() < b.len(): -1 else: 1
+    let i = a.len()
+    while i > 0:
+        i -= 1
+        if a[i] != b[i]:
+            return if a[i] < b[i]: -1 else: 1
+    0
+
+pub fn compare(a: BigInt, b: BigInt) -> i32:
+    if a.neg != b.neg:
+        return if a.neg: -1 else: 1
+    c := cmp_mag(a.mag, b.mag)
+    if a.neg: -c else: c
+
+fn add_mag(a: List[u32], b: List[u32]) -> List[u32]:
+    let mut out: List[u32] = []
+    let carry: u64 = 0
+    let n = if a.len() > b.len(): a.len() else: b.len()
+    for i in 0..n:
+        s := u64(a.get(i).unwrap_or(0)) + u64(b.get(i).unwrap_or(0)) + carry
+        out.push(u32(s % BASE))
+        carry = s / BASE
+    if carry > 0:
+        out.push(u32(carry))
+    out
+
+## a - b where |a| >= |b|.
+fn sub_mag(a: List[u32], b: List[u32]) -> List[u32]:
+    let mut out: List[u32] = []
+    let borrow: i64 = 0
+    for i in 0..a.len():
+        let d = i64(a[i]) - i64(b.get(i).unwrap_or(0)) - borrow
+        if d < 0:
+            d += i64(BASE)
+            borrow = 1
+        else:
+            borrow = 0
+        out.push(u32(d))
+    trim(out)
+
+pub fn add(a: BigInt, b: BigInt) -> BigInt:
+    if a.neg == b.neg:
+        return make(a.neg, add_mag(a.mag, b.mag))
+    c := cmp_mag(a.mag, b.mag)
+    if c == 0:
+        return make(false, [])
+    if c > 0:
+        return make(a.neg, sub_mag(a.mag, b.mag))
+    make(b.neg, sub_mag(b.mag, a.mag))
+
+pub fn negate(a: BigInt) -> BigInt:
+    make(!a.neg, a.mag)
+
+pub fn abs(a: BigInt) -> BigInt:
+    make(false, a.mag)
+
+pub fn sub(a: BigInt, b: BigInt) -> BigInt:
+    add(a, negate(b))
+
+fn mul_mag(a: List[u32], b: List[u32]) -> List[u32]:
+    if a.is_empty() || b.is_empty():
+        return []
+    let mut acc: List[u64] = [for _ in 0..(a.len() + b.len() + 1) => 0u64]
+    for i in 0..a.len():
+        let carry: u64 = 0
+        for j in 0..b.len():
+            cur := acc[i + j] + u64(a[i]) * u64(b[j]) + carry
+            acc[i + j] = cur % BASE
+            carry = cur / BASE
+        let k = i + b.len()
+        while carry > 0:
+            cur := acc[k] + carry
+            acc[k] = cur % BASE
+            carry = cur / BASE
+            k += 1
+    trim([for x in acc => u32(x)])
+
+pub fn mul(a: BigInt, b: BigInt) -> BigInt:
+    make(a.neg != b.neg, mul_mag(a.mag, b.mag))
+
+fn mul_small(a: List[u32], k: u64) -> List[u32]:
+    let mut out: List[u32] = []
+    let carry: u64 = 0
+    for x in a:
+        cur := u64(x) * k + carry
+        out.push(u32(cur % BASE))
+        carry = cur / BASE
+    while carry > 0:
+        out.push(u32(carry % BASE))
+        carry = carry / BASE
+    trim(out)
+
+## Truncated division of magnitudes: (quotient, remainder).
+fn divmod_mag(a: List[u32], b: List[u32]) -> (List[u32], List[u32]):
+    if cmp_mag(a, b) < 0:
+        return ([], a)
+    let mut quotient: List[u32] = [for _ in 0..a.len() => 0u32]
+    let rem: List[u32] = []
+    let i = a.len()
+    while i > 0:
+        i -= 1
+        # rem = rem * BASE + a[i]
+        let mut shifted: List[u32] = [a[i]]
+        shifted.extend(rem)
+        rem = trim(shifted)
+        # binary search the largest digit q with b * q <= rem
+        let lo: u64 = 0
+        let hi: u64 = BASE - 1
+        while lo < hi:
+            mid := (lo + hi + 1) / 2
+            if cmp_mag(mul_small(b, mid), rem) <= 0:
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo > 0:
+            rem = sub_mag(rem, mul_small(b, lo))
+        quotient[i] = u32(lo)
+    (trim(quotient), rem)
+
+## Truncated quotient and remainder (the remainder has the dividend's sign).
+pub fn divmod(a: BigInt, b: BigInt) -> (BigInt, BigInt):
+    let (q, r) = divmod_mag(a.mag, b.mag)
+    (make(a.neg != b.neg, q), make(a.neg, r))
+
+## The integer part of a finite float, exactly.
+pub fn from_f64_trunc(f: f64) -> BigInt:
+    t := f.trunc()
+    if t.abs() < 9.0e18:
+        return from_i64(i64(t))
+    bits := t.to_bits()
+    exp := i64((bits >> 52) & 0x7ff) - 1075
+    mant := (bits & 0xFFFFFFFFFFFFF) | (1u64 << 52)
+    let r = from_i64(i64(mant))
+    let k = exp
+    while k >= 20:
+        r = make(false, mul_small(r.mag, 1048576))
+        k -= 20
+    while k > 0:
+        r = make(false, mul_small(r.mag, 2))
+        k -= 1
+    if t < 0.0: negate(r) else: r
+
+pub fn is_zero(a: BigInt) -> bool:
+    a.mag.is_empty()
+
+tests:
+    it("round-trips and does arithmetic"):
+        a := parse("4722366482869645213696").unwrap_or(from_i64(0))
+        assert_equal(to_string(a), "4722366482869645213696")
+        assert_equal(to_string(add(a, from_i64(-1))), "4722366482869645213695")
+        assert_equal(to_string(mul(a, a)), "22300745198530623141535718272648361505980416")
+        let (q, r) = divmod(mul(a, a), parse("1000000007").unwrap_or(from_i64(1)))
+        assert_equal(
+            to_string(add(mul(q, parse("1000000007").unwrap_or(from_i64(1))), r)),
+            "22300745198530623141535718272648361505980416",
+        )
+        assert_equal(to_string(from_i64(-9223372036854775807i64 - 1)), "-9223372036854775808")
+        assert_equal(
+            to_i64(from_i64(-9223372036854775807i64 - 1)),
+            .Some(-9223372036854775807i64 - 1),
+        )
+        assert_equal(to_i64(a), .None)

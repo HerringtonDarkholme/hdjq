@@ -1,0 +1,1462 @@
+## Port of gojq/compiler.go (and option.go): compiles a query to bytecode.
+## Go closures that patch a reserved code later (`lazy`, `defer`) become an
+## explicit reserved index patched at the same point of the control flow.
+use std.console.ConsoleInput
+use std.fs.{FsRead, FsWrite}
+use std.time.{Clock, now}
+use pkg.goshim.value.{Value, arr, obj, empty_obj}
+use pkg.goshim.time.local
+use pkg.goshim.strconv.quote
+use pkg.gojq.code.{Code, Opcode, Operand, Callback, code, code0}
+use pkg.gojq.query.{Query, Term, TermType, Operator, Import, FuncDef, Pattern, PatternObject, Index, Func, StringT, Object, ObjectKeyVal, Array, Suffix, If, Try, Reduce, Foreach, Label, Unary, ConstObject, query_to_indices, index_to_index_key, unary_to_number, suffix_to_term, const_object_to_value, op_func, term_query}
+use pkg.gojq.iter.{Item, Iter, InputIter}
+use pkg.gojq.error.JqError
+use pkg.gojq.number.to_number
+use pkg.gojq.lexer.new_lexer
+use pkg.gojq.builtin.builtin_func_defs
+use pkg.gojq.func.{Function, internal_funcs, func_match, RegexpCache, new_regexp_cache, func_allocator, func_setpath_with_allocator, func_getpath_with_allocator, func_delpaths_with_allocator, call_math1, call_math2, call_math3, call_local, func_now}
+
+## ModuleLoader is the interface for loading modules.
+pub trait ModuleLoader:
+    fn load_init_modules!(&mut self) -> Result[List[*mut Query], JqError] $ FsRead
+    fn load_module_with_meta!(&mut self, name: string, meta: Map[string, Value]?) -> Result[*mut Query, JqError] $ FsRead
+    fn load_json_with_meta!(&mut self, name: string, meta: Map[string, Value]?) -> Result[Value, JqError] $ FsRead
+
+## The callbacks of functions given with WithFunction.
+pub trait CustomFunctions:
+    fn call!(&mut self, name: string, v: Value, args: List[Value]) -> Item $ Console + FsWrite
+
+## What compiled code keeps from its compiler (the state of gojq's closures).
+pub struct Runtime:
+    pub module_loader: (*mut dyn ModuleLoader)? = .None
+    pub input_iter: (*mut dyn InputIter)? = .None
+    pub custom: (*mut dyn CustomFunctions)? = .None
+    pub custom_funcs: Map[string, Function] = {}
+    pub builtin_defs: Map[string, List[*mut FuncDef]] = {}
+    pub regexp_cache: *mut RegexpCache
+
+## Code is a compiled jq query.
+pub struct CompiledCode:
+    pub variables: List[string]
+    ## []*code
+    pub codes: List[*Code]
+    pub rt: *mut Runtime
+
+pub struct VarInfo:
+    name: string
+    index: (i64, i64)
+    depth: i64
+
+pub struct FuncInfo:
+    name: string
+    pc: i64
+    argcnt: i64
+
+pub struct ScopeInfo:
+    variables: List[*mut VarInfo] = []
+    funcs: List[*mut FuncInfo] = []
+    id: i64
+    depth: i64 = 0
+    variablecnt: i64 = 0
+
+## CompilerOption values (option.go).
+pub struct Options:
+    pub module_loader: (*mut dyn ModuleLoader)? = .None
+    pub environ: (List[string])? = .None
+    pub variables: List[string] = []
+    pub custom: (*mut dyn CustomFunctions)? = .None
+    pub custom_funcs: Map[string, Function] = {}
+    pub input_iter: (*mut dyn InputIter)? = .None
+
+## WithFunction: registers a custom function of arities minarity..maxarity.
+pub fn with_function(opts: &mut Options, name: string, minarity: i64, maxarity: i64, iter: bool) -> void:
+    if !(0 <= minarity && minarity <= maxarity && maxarity <= 30):
+        panic("invalid arity for ${name}: $minarity, $maxarity")
+    argcount := (1i64 << u32(maxarity + 1)) - (1i64 << u32(minarity))
+    match opts.custom_funcs.get(name):
+        .Some(f) =>
+            if f.iter != iter:
+                panic("cannot define both iterator and non-iterator functions for ${name}")
+            opts.custom_funcs[name] = Function { argcount: argcount | f.argcount, iter: iter, callback: .Custom(name) }
+        .None => opts.custom_funcs[name] = Function { argcount: argcount, iter: iter, callback: .Custom(name) }
+
+struct Compiler:
+    module_loader: (*mut dyn ModuleLoader)?
+    environ: (List[string])?
+    variables: List[string]
+    custom_funcs: Map[string, Function]
+    has_input: bool
+    codes: List[Code] = []
+    builtin_scope: *mut ScopeInfo
+    scopes: List[*mut ScopeInfo] = []
+    scopecnt: i64 = 0
+    builtin_defs: Map[string, List[*mut FuncDef]]
+    internal: Map[string, Function]
+    rt: *mut Runtime
+
+## Compile compiles a query.
+pub fn compile!(q: *mut Query, opts: Options) -> Result[CompiledCode, JqError] $ FsRead:
+    rt := box(Runtime { module_loader: opts.module_loader, input_iter: opts.input_iter, custom: opts.custom, custom_funcs: opts.custom_funcs, regexp_cache: new_regexp_cache() })
+    let mut c = Compiler {
+        module_loader: opts.module_loader,
+        environ: opts.environ,
+        variables: opts.variables,
+        custom_funcs: opts.custom_funcs,
+        has_input: opts.input_iter.is_some(),
+        builtin_scope: box(ScopeInfo { id: 0 }),
+        builtin_defs: builtin_func_defs(),
+        internal: internal_funcs(),
+        rt: rt,
+    }
+    c.builtin_scope = c.new_scope()
+    scope := c.new_scope()
+    c.scopes = [scope]
+    setscope := c.reserve()
+    for name in c.variables:
+        if !new_lexer(name).valid_var_name():
+            return .Err(.VariableName(name))
+        v := c.push_variable(name)
+        c.append(code(.OpStore, var_op(v)))
+    match c.module_loader:
+        .Some(ml) =>
+            let qs = match ml.load_init_modules!():
+                .Ok(xs) => xs
+                .Err(e) => return .Err(e)
+            for mq in qs:
+                match c.compile_module!(mq, ""):
+                    .Ok(_) => pass
+                    .Err(e) => return .Err(e)
+        .None => pass
+    c.compile!(q)?
+    c.codes[setscope] = code(.OpScope, .Scope(scope.id, scope.variablecnt, 0))
+    c.optimize_tail_rec()
+    c.optimize_code_ops()
+    rt.builtin_defs = c.builtin_defs
+    .Ok(CompiledCode { variables: c.variables, codes: [for x in c.codes => box(x)], rt: rt })
+
+fn var_op(v: (i64, i64)) -> Operand:
+    .Var(v._0, v._1)
+
+impl Compiler:
+    fn append(&mut self, c: Code) -> void:
+        self.codes.push(c)
+
+    ## c.lazy: reserves a code to be filled in later.
+    fn reserve(&mut self) -> usize:
+        self.codes.push(code0(.OpNop))
+        self.codes.len() - 1
+
+    fn len(&self) -> i64:
+        i64(self.codes.len())
+
+    fn new_variable(&mut self) -> (i64, i64):
+        self.create_variable("")
+
+    fn push_variable(&mut self, name: string) -> (i64, i64):
+        s := self.scopes[self.scopes.len() - 1]
+        for v in s.variables:
+            if v.name == name && v.depth == s.depth:
+                return v.index
+        self.create_variable(name)
+
+    fn create_variable(&mut self, name: string) -> (i64, i64):
+        s := self.scopes[self.scopes.len() - 1]
+        v := (s.id, s.variablecnt)
+        s.variablecnt += 1
+        s.variables.push(box(VarInfo { name: name, index: v, depth: s.depth }))
+        v
+
+    fn lookup_variable(&self, name: string) -> Result[(i64, i64), JqError]:
+        let i = self.scopes.len()
+        while i > 0:
+            i -= 1
+            s := self.scopes[i]
+            let j = s.variables.len()
+            while j > 0:
+                j -= 1
+                w := s.variables[j]
+                if w.name == name:
+                    return .Ok(w.index)
+        .Err(.VariableNotFound(name))
+
+    fn lookup_func_or_variable(&self, name: string) -> ((*mut FuncInfo)?, (*mut VarInfo)?):
+        is_func := !name.starts_with("\$")
+        let i = self.scopes.len()
+        while i > 0:
+            i -= 1
+            s := self.scopes[i]
+            if is_func:
+                let j = s.funcs.len()
+                while j > 0:
+                    j -= 1
+                    f := s.funcs[j]
+                    if f.name == name && f.argcnt == 0:
+                        return (.Some(f), .None)
+            let j = s.variables.len()
+            while j > 0:
+                j -= 1
+                v := s.variables[j]
+                if v.name == name:
+                    return (.None, .Some(v))
+        (.None, .None)
+
+    fn lookup_builtin(&self, name: string, argcnt: i64) -> (*mut FuncInfo)?:
+        s := self.builtin_scope
+        let i = s.funcs.len()
+        while i > 0:
+            i -= 1
+            f := s.funcs[i]
+            if f.name == name && f.argcnt == argcnt:
+                return .Some(f)
+        .None
+
+    ## appendBuiltin; returns the reserved jump to patch with end_builtin.
+    fn append_builtin(&mut self, name: string, argcnt: i64) -> usize:
+        setjump := self.reserve()
+        self.builtin_scope.funcs.push(box(FuncInfo { name: name, pc: self.len(), argcnt: argcnt }))
+        setjump
+
+    fn end_builtin(&mut self, setjump: usize) -> void:
+        self.codes[setjump] = code(.OpJump, .Int(self.len()))
+
+    fn new_scope(&mut self) -> *mut ScopeInfo:
+        i := self.scopecnt
+        self.scopecnt += 1
+        box(ScopeInfo { id: i })
+
+    ## newScopeDepth; pass the result to end_scope_depth.
+    fn new_scope_depth(&mut self) -> (*mut ScopeInfo, usize, usize):
+        scope := self.scopes[self.scopes.len() - 1]
+        l := scope.variables.len()
+        m := scope.funcs.len()
+        scope.depth += 1
+        (scope, l, m)
+
+    fn end_scope_depth(&mut self, saved: (*mut ScopeInfo, usize, usize)) -> void:
+        scope := saved._0
+        scope.depth -= 1
+        scope.variables.truncate(saved._1)
+        scope.funcs.truncate(saved._2)
+
+    fn compile!(&mut self, q: *mut Query) -> Result[void, JqError] $ FsRead:
+        for i in q.imports:
+            self.compile_import!(i)?
+        self.compile_query!(q)?
+        self.append(code0(.OpRet))
+        .Ok(())
+
+    fn compile_import!(&mut self, i: *mut Import) -> Result[void, JqError] $ FsRead:
+        path := if i.import_path != "": i.import_path else: i.include_path
+        alias := i.import_alias
+        let .Some(loader) = self.module_loader else:
+            return .Err(.Message("cannot load module: ${quote(path)}"))
+        let meta: Map[string, Value]? = match i.meta:
+            .Some(m) => .Some(const_object_to_value(m))
+            .None => .None
+        if alias.starts_with("\$"):
+            vals := loader.load_json_with_meta!(path, meta)?
+            self.append(code(.OpPush, .Val(vals)))
+            self.append(code(.OpStore, var_op(self.push_variable(alias))))
+            self.append(code(.OpPush, .Val(vals)))
+            self.append(code(.OpStore, var_op(self.push_variable(alias + "::" + alias.slice(1, alias.len())))))
+            return .Ok(())
+        mq := loader.load_module_with_meta!(path, meta)?
+        self.compile_module!(mq, alias)
+
+    fn compile_module!(&mut self, q: *mut Query, alias: string) -> Result[void, JqError] $ FsRead:
+        scope := self.scopes[self.scopes.len() - 1]
+        scope.depth += 1
+        vl := scope.variables.len()
+        fl := scope.funcs.len()
+        for i in q.imports:
+            self.compile_import!(i)?
+        for fd in q.func_defs:
+            self.compile_func_def!(fd, false)?
+        scope.depth -= 1
+        scope.variables.truncate(vl)
+        if alias != "":
+            for k in fl..scope.funcs.len():
+                f := scope.funcs[k]
+                f.name = alias + "::" + f.name
+        .Ok(())
+
+    fn compile_func_def!(&mut self, e: *mut FuncDef, builtin: bool) -> Result[void, JqError] $ FsRead:
+        let scope = if builtin: self.builtin_scope else: self.scopes[self.scopes.len() - 1]
+        setjump := self.reserve()
+        scope.funcs.push(box(FuncInfo { name: e.name, pc: self.len(), argcnt: i64(e.args.len()) }))
+        saved_scopes := self.scopes
+        saved_variables := self.variables
+        self.variables = []
+        scope = self.new_scope()
+        if builtin:
+            self.scopes = [self.builtin_scope, scope]
+        else:
+            self.scopes.push(scope)
+        setscope := self.reserve()
+        if !e.args.is_empty():
+            let mut vis: List[(string, (i64, i64))] = []
+            v := self.new_variable()
+            self.append(code(.OpStore, var_op(v)))
+            for arg in e.args:
+                if arg.starts_with("\$"):
+                    w := self.create_variable(arg.slice(1, arg.len()))
+                    self.append(code(.OpStore, var_op(w)))
+                    vis.push((arg, w))
+                else:
+                    self.append(code(.OpStore, var_op(self.create_variable(arg))))
+            for (name, w) in vis:
+                self.append(code(.OpLoad, var_op(v)))
+                self.append(code0(.OpExpBegin))
+                self.append(code(.OpLoad, var_op(w)))
+                self.append(code0(.OpCallPc))
+                self.append(code(.OpStore, var_op(self.push_variable(name))))
+                self.append(code0(.OpExpEnd))
+            self.append(code(.OpLoad, var_op(v)))
+        self.compile!(e.body)?
+        self.codes[setscope] = code(.OpScope, .Scope(scope.id, scope.variablecnt, i64(e.args.len())))
+        self.scopes = saved_scopes
+        self.variables = saved_variables
+        self.codes[setjump] = code(.OpJump, .Int(self.len()))
+        .Ok(())
+
+    fn compile_query!(&mut self, e: *mut Query) -> Result[void, JqError] $ FsRead:
+        for fd in e.func_defs:
+            self.compile_func_def!(fd, false)?
+        match e.term:
+            .Some(t) => return self.compile_term!(t)
+            .None => pass
+        let .Some(l) = e.left else:
+            return .Err(.Message("missing query (try \".\")"))
+        let .Some(r) = e.right else:
+            return .Err(.Message("missing query (try \".\")"))
+        match e.op:
+            .OpNone => .Err(.Message("missing query (try \".\")"))
+            .OpPipe =>
+                if !e.patterns.is_empty():
+                    return self.compile_bind!(l, r, e.patterns)
+                self.compile_query!(l)?
+                self.compile_query!(r)
+            .OpComma => self.compile_comma!(l, r)
+            .OpAlt => self.compile_alt!(l, r)
+            .OpAssign => self.compile_query_update!(l, r, e.op)
+            .OpModify => self.compile_query_update!(l, r, e.op)
+            .OpUpdateAdd => self.compile_query_update!(l, r, e.op)
+            .OpUpdateSub => self.compile_query_update!(l, r, e.op)
+            .OpUpdateMul => self.compile_query_update!(l, r, e.op)
+            .OpUpdateDiv => self.compile_query_update!(l, r, e.op)
+            .OpUpdateMod => self.compile_query_update!(l, r, e.op)
+            .OpUpdateAlt => self.compile_query_update!(l, r, e.op)
+            .OpOr =>
+                self.compile_if!(box(If {
+                    cond: l,
+                    then_: term_query(box(Term { typ: .TermTypeTrue })),
+                    else_: .Some(term_query(box(Term { typ: .TermTypeIf, if_: .Some(box(If {
+                        cond: r,
+                        then_: term_query(box(Term { typ: .TermTypeTrue })),
+                        else_: .Some(term_query(box(Term { typ: .TermTypeFalse }))),
+                    })) }))),
+                }))
+            .OpAnd =>
+                self.compile_if!(box(If {
+                    cond: l,
+                    then_: term_query(box(Term { typ: .TermTypeIf, if_: .Some(box(If {
+                        cond: r,
+                        then_: term_query(box(Term { typ: .TermTypeTrue })),
+                        else_: .Some(term_query(box(Term { typ: .TermTypeFalse }))),
+                    })) })),
+                    else_: .Some(term_query(box(Term { typ: .TermTypeFalse }))),
+                }))
+            _ => self.compile_call!(op_func(e.op), [l, r])
+
+    fn compile_comma!(&mut self, l: *mut Query, r: *mut Query) -> Result[void, JqError] $ FsRead:
+        setfork := self.reserve()
+        self.compile_query!(l)?
+        setjump := self.reserve()
+        self.codes[setfork] = code(.OpFork, .Int(self.len()))
+        self.compile_query!(r)?
+        self.codes[setjump] = code(.OpJump, .Int(self.len()))
+        .Ok(())
+
+    fn compile_alt!(&mut self, l: *mut Query, r: *mut Query) -> Result[void, JqError] $ FsRead:
+        self.append(code(.OpPush, .Val(.Bool(false))))
+        found := self.new_variable()
+        self.append(code(.OpStore, var_op(found)))
+        setfork := self.reserve()
+        self.compile_query!(l)?
+        self.append(code0(.OpDup))
+        self.append(code(.OpJumpIfNot, .Int(self.len() + 4)))
+        self.append(code(.OpPush, .Val(.Bool(true))))
+        self.append(code(.OpStore, var_op(found)))
+        setjump := self.reserve()
+        self.append(code0(.OpPop))
+        self.append(code0(.OpBacktrack))
+        self.codes[setfork] = code(.OpFork, .Int(self.len()))
+        self.append(code(.OpLoad, var_op(found)))
+        self.append(code(.OpJumpIfNot, .Int(self.len() + 3)))
+        self.append(code0(.OpBacktrack))
+        self.append(code0(.OpPop))
+        self.compile_query!(r)?
+        self.codes[setjump] = code(.OpJump, .Int(self.len()))
+        .Ok(())
+
+    fn compile_query_update!(&mut self, l: *mut Query, r: *mut Query, op: Operator) -> Result[void, JqError] $ FsRead:
+        match op:
+            .OpAssign =>
+                # optimize assignment operator with constant indexing and slicing
+                match query_to_indices(l, []):
+                    .Some(xs) =>
+                        v := self.new_variable()
+                        self.append(code(.OpStore, var_op(v)))
+                        self.append(code(.OpLoad, var_op(v)))
+                        self.compile_query!(r)?
+                        self.append(code(.OpPush, .Val(arr(xs))))
+                        self.append(code(.OpLoad, var_op(v)))
+                        self.append(code(.OpCall, .Call(self.internal["setpath"].callback, 2, "setpath")))
+                        return .Ok(())
+                    .None => pass
+                self.compile_func!(box(Func { name: op_func(op), args: [l, r] }))
+            .OpModify => self.compile_func!(box(Func { name: op_func(op), args: [l, r] }))
+            _ =>
+                name := "\$%0"
+                self.append(code0(.OpDup))
+                self.compile_query!(r)?
+                self.append(code(.OpStore, var_op(self.push_variable(name))))
+                self.compile_func!(box(Func {
+                    name: "_modify",
+                    args: [
+                        l,
+                        term_query(box(Term { typ: .TermTypeFunc, func: .Some(box(Func {
+                            name: op_func(op),
+                            args: [
+                                term_query(box(Term { typ: .TermTypeIdentity })),
+                                term_query(box(Term { typ: .TermTypeFunc, func: .Some(box(Func { name: name })) })),
+                            ],
+                        })) })),
+                    ],
+                }))
+
+    fn compile_bind!(&mut self, l: *mut Query, r: *mut Query, patterns: List[*mut Pattern]) -> Result[void, JqError] $ FsRead:
+        saved := self.new_scope_depth()
+        self.append(code0(.OpDup))
+        self.append(code0(.OpExpBegin))
+        self.compile_query!(l)?
+        self.compile_patterns!(patterns, .Bind(r))?
+        self.end_scope_depth(saved)
+        .Ok(())
+
+    ## compilePatterns; the body closure is described by `body`.
+    fn compile_patterns!(&mut self, patterns: List[*mut Pattern], body: PatternBody) -> Result[void, JqError] $ FsRead:
+        let mut vs: List[(i64, i64)] = []
+        if patterns.len() > 1:
+            for p in patterns:
+                vs = self.push_pattern_variables(vs, p)
+        # Go defers these patches until after the body; they do not interact.
+        let mut forkalts: List[(usize, i64)] = []
+        let mut jumps: List[usize] = []
+        for (i, p) in patterns.iter().enumerate():
+            let forkalt_slot = 0usize
+            if i < patterns.len() - 1:
+                forkalt_slot = self.reserve()
+            for v in vs:
+                self.append(code(.OpPush, .Val(.Null)))
+                self.append(code(.OpStore, var_op(v)))
+            _ := self.compile_pattern!([], p)?
+            if i < patterns.len() - 1:
+                jumps.push(self.reserve())
+                forkalts.push((forkalt_slot, self.len()))
+        let pc = 0i64
+        if patterns.len() > 1:
+            pc = self.len()
+        self.compile_pattern_body!(patterns.len(), body)?
+        for (slot, pcc) in forkalts:
+            self.codes[slot] = code(.OpForkAlt, .Int(pcc))
+        for slot in jumps:
+            self.codes[slot] = code(.OpJump, .Int(pc))
+        .Ok(())
+
+    fn compile_pattern_body!(&mut self, npatterns: usize, body: PatternBody) -> Result[void, JqError] $ FsRead:
+        match body:
+            .Bind(r) =>
+                n := self.codes.len()
+                if npatterns == 1 && self.codes[n - 2].op == .OpExpBegin:
+                    self.codes[n - 2].op = .OpNop
+                else:
+                    self.append(code0(.OpExpEnd))
+                self.compile_query!(r)?
+            .ReduceBody(v, update) =>
+                self.append(code(.OpLoad, var_op(v)))
+                saved := self.new_scope_depth()
+                self.compile_query!(update)?
+                self.end_scope_depth(saved)
+                self.append(code(.OpStore, var_op(v)))
+                self.append(code0(.OpBacktrack))
+            .ForeachBody(v, update, extract) =>
+                self.append(code(.OpLoad, var_op(v)))
+                saved := self.new_scope_depth()
+                self.compile_query!(update)?
+                self.end_scope_depth(saved)
+                self.append(code0(.OpDup))
+                self.append(code(.OpStore, var_op(v)))
+                match extract:
+                    .Some(x) =>
+                        saved2 := self.new_scope_depth()
+                        self.compile_query!(x)?
+                        self.end_scope_depth(saved2)
+                    .None => pass
+        .Ok(())
+
+    fn push_pattern_variables(&mut self, vs0: List[(i64, i64)], p: *mut Pattern) -> List[(i64, i64)]:
+        let mut vs = vs0
+        if p.name != "":
+            v := self.push_variable(p.name)
+            if !vs.contains(&v):
+                vs.push(v)
+        else if !p.array.is_empty():
+            for q in p.array:
+                vs = self.push_pattern_variables(vs, q)
+        else if !p.object.is_empty():
+            for kv in p.object:
+                if kv.key != "" && kv.key.starts_with("\$"):
+                    vs = self.push_pattern_variables(vs, box(Pattern { name: kv.key }))
+                match kv.val:
+                    .Some(q) => vs = self.push_pattern_variables(vs, q)
+                    .None => pass
+        vs
+
+    fn compile_pattern!(&mut self, vs0: List[(i64, i64)], p: *mut Pattern) -> Result[List[(i64, i64)], JqError] $ FsRead:
+        let mut vs = vs0
+        if p.name != "":
+            v := self.push_variable(p.name)
+            self.append(code(.OpStore, var_op(v)))
+            vs.push(v)
+            return .Ok(vs)
+        if !p.array.is_empty():
+            v := self.new_variable()
+            self.append(code(.OpStore, var_op(v)))
+            for (i, q) in p.array.iter().enumerate():
+                self.append(code(.OpLoad, var_op(v)))
+                self.append(code(.OpIndexArray, .Val(.Int(i64(i)))))
+                vs = self.compile_pattern!(vs, q)?
+            return .Ok(vs)
+        if !p.object.is_empty():
+            v := self.new_variable()
+            self.append(code(.OpStore, var_op(v)))
+            for kv in p.object:
+                let key = ""
+                let name = ""
+                self.append(code(.OpLoad, var_op(v)))
+                key = kv.key
+                if key != "":
+                    if key.starts_with("\$"):
+                        name = key
+                        key = key.slice(1, key.len())
+                else:
+                    match kv.key_string:
+                        .Some(ks) =>
+                            key = ks.str
+                            if key == "":
+                                self.compile_string!(ks, .None)?
+                        .None =>
+                            match kv.key_query:
+                                .Some(kq) => self.compile_query!(kq)?
+                                .None => pass
+                if key != "":
+                    self.append(code(.OpIndex, .Val(.Str(key))))
+                else:
+                    self.append(code(.OpLoad, var_op(v)))
+                    self.append(code(.OpPush, .Val(.Null)))
+                    self.append(code(.OpCall, .Call(self.internal["_index"].callback, 2, "_index")))
+                if name != "":
+                    if kv.val.is_some():
+                        self.append(code0(.OpDup))
+                    vs = self.compile_pattern!(vs, box(Pattern { name: name }))?
+                match kv.val:
+                    .Some(q) => vs = self.compile_pattern!(vs, q)?
+                    .None => pass
+            return .Ok(vs)
+        .Err(.Message("invalid pattern"))
+
+    fn compile_if!(&mut self, e: *mut If) -> Result[void, JqError] $ FsRead:
+        self.append(code0(.OpDup))
+        self.append(code0(.OpExpBegin))
+        pc := self.codes.len()
+        saved := self.new_scope_depth()
+        self.compile_query!(e.cond)?
+        self.end_scope_depth(saved)
+        if pc == self.codes.len():
+            self.codes.truncate(pc - 1)
+        else:
+            self.append(code0(.OpExpEnd))
+        pcc := self.codes.len()
+        setjumpifnot := self.reserve()
+        saved2 := self.new_scope_depth()
+        self.compile_query!(e.then_)?
+        self.end_scope_depth(saved2)
+        setjump := self.reserve()
+        self.codes[setjumpifnot] = code(.OpJumpIfNot, .Int(self.len()))
+        if !e.elif.is_empty():
+            first := e.elif[0]
+            self.compile_if!(box(If { cond: first.cond, then_: first.then_, elif: e.elif.slice(1, e.elif.len()), else_: e.else_ }))?
+        else:
+            match e.else_:
+                .Some(el) =>
+                    saved3 := self.new_scope_depth()
+                    self.compile_query!(el)?
+                    # optimize constant results
+                    if pcc + 4 == self.codes.len() && self.codes[pcc + 1].op == .OpConst && self.codes[pcc + 3].op == .OpConst:
+                        self.codes[pc - 2].op = .OpNop
+                        self.codes[pcc + 1].op = .OpPush
+                        self.codes[pcc + 3].op = .OpPush
+                    self.end_scope_depth(saved3)
+                .None => pass
+        self.codes[setjump] = code(.OpJump, .Int(self.len()))
+        .Ok(())
+
+    fn compile_try!(&mut self, e: *mut Try) -> Result[void, JqError] $ FsRead:
+        setforktrybegin := self.reserve()
+        saved := self.new_scope_depth()
+        self.compile_query!(e.body)?
+        self.end_scope_depth(saved)
+        self.append(code0(.OpForkTryEnd))
+        setjump := self.reserve()
+        self.codes[setforktrybegin] = code(.OpForkTryBegin, .Int(self.len()))
+        match e.catch:
+            .Some(c) =>
+                saved2 := self.new_scope_depth()
+                self.compile_query!(c)?
+                self.end_scope_depth(saved2)
+            .None => self.append(code0(.OpBacktrack))
+        self.codes[setjump] = code(.OpJump, .Int(self.len()))
+        .Ok(())
+
+    fn compile_reduce!(&mut self, e: *mut Reduce) -> Result[void, JqError] $ FsRead:
+        saved := self.new_scope_depth()
+        self.append(code0(.OpDup))
+        v := self.new_variable()
+        s1 := self.new_scope_depth()
+        self.compile_query!(e.start)?
+        self.end_scope_depth(s1)
+        self.append(code(.OpStore, var_op(v)))
+        setfork := self.reserve()
+        self.compile_query!(e.query)?
+        self.compile_patterns!(e.patterns, .ReduceBody(v, e.update))?
+        self.codes[setfork] = code(.OpFork, .Int(self.len()))
+        self.append(code0(.OpPop))
+        self.append(code(.OpLoad, var_op(v)))
+        self.end_scope_depth(saved)
+        .Ok(())
+
+    fn compile_foreach!(&mut self, e: *mut Foreach) -> Result[void, JqError] $ FsRead:
+        saved := self.new_scope_depth()
+        self.append(code0(.OpDup))
+        v := self.new_variable()
+        s1 := self.new_scope_depth()
+        self.compile_query!(e.start)?
+        self.end_scope_depth(s1)
+        self.append(code(.OpStore, var_op(v)))
+        self.compile_query!(e.query)?
+        self.compile_patterns!(e.patterns, .ForeachBody(v, e.update, e.extract))?
+        self.end_scope_depth(saved)
+        .Ok(())
+
+    fn compile_label!(&mut self, e: *mut Label) -> Result[void, JqError] $ FsRead:
+        v := self.push_variable("\$%" + e.ident.slice(1, e.ident.len()))
+        self.append(code(.OpForkLabel, var_op(v)))
+        self.compile_query!(e.body)
+
+    fn compile_break(&mut self, label: string) -> Result[void, JqError]:
+        let .Ok(v) = self.lookup_variable("\$%" + label.slice(1, label.len())) else:
+            return .Err(.Break(label, .Null))
+        self.append(code0(.OpPop))
+        self.append(code(.OpLoad, var_op(v)))
+        self.append(code(.OpCall, .Call(.Break(label), 0, "_break")))
+        .Ok(())
+
+    fn compile_term!(&mut self, e: *mut Term) -> Result[void, JqError] $ FsRead:
+        if !e.suffix_list.is_empty():
+            s := e.suffix_list[e.suffix_list.len() - 1]
+            # clone without changing e
+            t := box(Term { ...*e, suffix_list: e.suffix_list.slice(0, e.suffix_list.len() - 1) })
+            return self.compile_term_suffix!(t, s)
+        match e.typ:
+            .TermTypeIdentity => .Ok(())
+            .TermTypeRecurse => self.compile_func!(box(Func { name: "recurse" }))
+            .TermTypeNull =>
+                self.append(code(.OpConst, .Val(.Null)))
+                .Ok(())
+            .TermTypeTrue =>
+                self.append(code(.OpConst, .Val(.Bool(true))))
+                .Ok(())
+            .TermTypeFalse =>
+                self.append(code(.OpConst, .Val(.Bool(false))))
+                .Ok(())
+            .TermTypeIndex =>
+                let .Some(ix) = e.index else: return .Err(.Message("invalid term"))
+                self.compile_index!(box(Term { typ: .TermTypeIdentity }), ix)
+            .TermTypeFunc =>
+                let .Some(f) = e.func else: return .Err(.Message("invalid term"))
+                self.compile_func!(f)
+            .TermTypeObject =>
+                let .Some(o) = e.object else: return .Err(.Message("invalid term"))
+                self.compile_object!(o)
+            .TermTypeArray =>
+                let .Some(a) = e.array else: return .Err(.Message("invalid term"))
+                self.compile_array!(a)
+            .TermTypeNumber =>
+                self.append(code(.OpConst, .Val(to_number(e.number))))
+                .Ok(())
+            .TermTypeUnary =>
+                let .Some(u) = e.unary else: return .Err(.Message("invalid term"))
+                self.compile_unary!(u)
+            .TermTypeFormat => self.compile_format!(e.format, e.str)
+            .TermTypeString =>
+                let .Some(s) = e.str else: return .Err(.Message("invalid term"))
+                self.compile_string!(s, .None)
+            .TermTypeIf =>
+                let .Some(x) = e.if_ else: return .Err(.Message("invalid term"))
+                self.compile_if!(x)
+            .TermTypeTry =>
+                let .Some(x) = e.try_ else: return .Err(.Message("invalid term"))
+                self.compile_try!(x)
+            .TermTypeReduce =>
+                let .Some(x) = e.reduce else: return .Err(.Message("invalid term"))
+                self.compile_reduce!(x)
+            .TermTypeForeach =>
+                let .Some(x) = e.foreach else: return .Err(.Message("invalid term"))
+                self.compile_foreach!(x)
+            .TermTypeLabel =>
+                let .Some(x) = e.label else: return .Err(.Message("invalid term"))
+                self.compile_label!(x)
+            .TermTypeBreak => self.compile_break(e.break_)
+            .TermTypeQuery =>
+                let .Some(x) = e.query else: return .Err(.Message("invalid term"))
+                saved := self.new_scope_depth()
+                r := self.compile_query!(x)
+                self.end_scope_depth(saved)
+                r
+
+    fn compile_index!(&mut self, e: *mut Term, x: *mut Index) -> Result[void, JqError] $ FsRead:
+        match index_to_index_key(x):
+            .Some(k) =>
+                self.compile_term!(e)?
+                self.append(code(.OpIndex, .Val(k)))
+                return .Ok(())
+            .None => pass
+        match x.str:
+            .Some(s) => return self.compile_call!("_index", [term_query(e), term_query(box(Term { typ: .TermTypeString, str: .Some(s) }))])
+            .None => pass
+        if !x.is_slice:
+            let .Some(start) = x.start else: return .Err(.Message("invalid index"))
+            return self.compile_call!("_index", [term_query(e), start])
+        null_q := fn() -> *mut Query: term_query(box(Term { typ: .TermTypeNull }))
+        match (x.start, x.end):
+            (.None, .Some(end)) => self.compile_call!("_slice", [term_query(e), end, null_q()])
+            (.Some(start), .None) => self.compile_call!("_slice", [term_query(e), null_q(), start])
+            (.Some(start), .Some(end)) => self.compile_call!("_slice", [term_query(e), end, start])
+            (.None, .None) => self.compile_call!("_slice", [term_query(e), null_q(), null_q()])
+
+    fn compile_func!(&mut self, e: *mut Func) -> Result[void, JqError] $ FsRead:
+        argc := i64(e.args.len())
+        if argc == 0:
+            let (f, v) = self.lookup_func_or_variable(e.name)
+            match f:
+                .Some(fi) => return self.compile_call_pc!(fi, e.args)
+                .None => pass
+            match v:
+                .Some(vi) =>
+                    if e.name.starts_with("\$"):
+                        self.append(code0(.OpPop))
+                        self.append(code(.OpLoad, var_op(vi.index)))
+                    else:
+                        self.append(code(.OpLoad, var_op(vi.index)))
+                        self.append(code0(.OpCallPc))
+                    return .Ok(())
+                .None => pass
+            if e.name == "\$ENV" || e.name == "env":
+                let mut env: Map[string, Value] = {}
+                match self.environ:
+                    .Some(kvs) =>
+                        for kv in kvs:
+                            match kv.split_once("="):
+                                .Some((k, val)) =>
+                                    if k != "":
+                                        env[k] = .Str(val)
+                                .None => pass
+                    .None => pass
+                self.append(code(.OpConst, .Val(obj(env))))
+                return .Ok(())
+            if e.name.starts_with("\$"):
+                return .Err(.VariableNotFound(e.name))
+        else:
+            let i = self.scopes.len()
+            while i > 0:
+                i -= 1
+                s := self.scopes[i]
+                let j = s.funcs.len()
+                while j > 0:
+                    j -= 1
+                    f := s.funcs[j]
+                    if f.name == e.name && f.argcnt == argc:
+                        return self.compile_call_pc!(f, e.args)
+        match self.lookup_builtin(e.name, argc):
+            .Some(f) => return self.compile_call_pc!(f, e.args)
+            .None => pass
+        match self.builtin_defs.get(e.name):
+            .Some(fds) =>
+                let compiled = false
+                for fd in fds:
+                    if i64(fd.args.len()) == argc:
+                        self.compile_func_def!(fd, true)?
+                        compiled = true
+                        break
+                if !compiled:
+                    match e.name:
+                        "_assign" => self.compile_assign()
+                        "_modify" => self.compile_modify()
+                        "_last" => self.compile_last()
+                        _ => pass
+                match self.lookup_builtin(e.name, argc):
+                    .Some(f) => return self.compile_call_pc!(f, e.args)
+                    .None => pass
+            .None => pass
+        match self.internal.get(e.name):
+            .Some(fun) =>
+                if fun.accept(argc):
+                    match e.name:
+                        "empty" =>
+                            self.append(code0(.OpBacktrack))
+                            return .Ok(())
+                        "path" =>
+                            self.append(code0(.OpPathBegin))
+                            self.compile_call!(e.name, e.args)?
+                            n := self.codes.len()
+                            self.codes[n - 1] = code0(.OpPathEnd)
+                            return .Ok(())
+                        "builtins" => return self.compile_call_internal!(.Call(.Builtins, 0, e.name), e.args, true, -1)
+                        "input" =>
+                            if !self.has_input:
+                                return .Err(.InputNotAllowed)
+                            return self.compile_call_internal!(.Call(.Input, 0, e.name), e.args, true, -1)
+                        "modulemeta" => return self.compile_call_internal!(.Call(.Modulemeta, 0, e.name), e.args, true, -1)
+                        "debug" =>
+                            setfork := self.reserve()
+                            self.compile_query!(e.args[0])?
+                            match self.compile_func!(box(Func { name: "debug" })):
+                                .Ok(_) => pass
+                                .Err(.FuncNotFound(_, _)) => return .Err(.FuncNotFound(e.name, argc))
+                                .Err(er) => return .Err(er)
+                            self.append(code0(.OpBacktrack))
+                            self.codes[setfork] = code(.OpFork, .Int(self.len()))
+                            return .Ok(())
+                        "_match" => return self.compile_call_internal!(.Call(.Match, argc, e.name), e.args, true, -1)
+                        _ => return self.compile_call!(e.name, e.args)
+            .None => pass
+        match self.custom_funcs.get(e.name):
+            .Some(fun) =>
+                if fun.accept(argc):
+                    self.compile_call_internal!(.Call(.Custom(e.name), argc, e.name), e.args, true, -1)?
+                    if fun.iter:
+                        self.append(code0(.OpIter))
+                    return .Ok(())
+            .None => pass
+        .Err(.FuncNotFound(e.name, argc))
+
+    ## compileAssign: `def _assign(p; $x): reduce path(p) as $q (.; setpath($q; $x));`
+    fn compile_assign(&mut self) -> void:
+        setjump := self.append_builtin("_assign", 2)
+        scope := self.new_scope()
+        sid := scope.id
+        v := Operand.Var(sid, 0)
+        p := Operand.Var(sid, 1)
+        x := Operand.Var(sid, 2)
+        a := Operand.Var(sid, 3)
+        w := Operand.Var(sid, 4)
+        q := Operand.Var(sid, 5)
+        base := self.len()
+        let codes: List[Code] = [
+            code(.OpScope, .Scope(sid, 6, 2)),
+            code(.OpStore, v),
+            code(.OpStore, p),
+            code(.OpStore, x),
+            code(.OpLoad, v),
+            code0(.OpExpBegin),
+            code(.OpLoad, x),
+            code0(.OpCallPc),
+            code(.OpStore, x),
+            code0(.OpExpEnd),
+            code(.OpPush, .Val(.Null)),
+            code(.OpCall, .Call(.Allocator, 0, "_allocator")),
+            code(.OpStore, a),
+            code(.OpLoad, v),
+            code(.OpFork, .Int(base + 30)),
+            code0(.OpDup),
+            code(.OpStore, w),
+            code0(.OpPathBegin),
+            code(.OpLoad, p),
+            code0(.OpCallPc),
+            code(.OpLoad, w),
+            code0(.OpPathEnd),
+            code(.OpStore, q),
+            code(.OpLoad, a),
+            code(.OpLoad, x),
+            code(.OpLoad, q),
+            code(.OpLoad, w),
+            code(.OpCall, .Call(.SetpathAlloc, 3, "_setpath")),
+            code(.OpStore, w),
+            code0(.OpBacktrack),
+            code0(.OpPop),
+            code(.OpLoad, w),
+            code0(.OpRet),
+        ]
+        self.codes.extend(codes)
+        self.end_builtin(setjump)
+
+    ## compileModify: the update-assignment operator `|=`.
+    fn compile_modify(&mut self) -> void:
+        setjump := self.append_builtin("_modify", 2)
+        scope := self.new_scope()
+        sid := scope.id
+        v := Operand.Var(sid, 0)
+        p := Operand.Var(sid, 1)
+        f := Operand.Var(sid, 2)
+        d := Operand.Var(sid, 3)
+        a := Operand.Var(sid, 4)
+        l := Operand.Var(sid, 5)
+        base := self.len()
+        let codes: List[Code] = [
+            code(.OpScope, .Scope(sid, 6, 2)),
+            code(.OpStore, v),
+            code(.OpStore, p),
+            code(.OpStore, f),
+            code(.OpPush, .Val(arr([]))),
+            code(.OpStore, d),
+            code(.OpPush, .Val(.Null)),
+            code(.OpCall, .Call(.Allocator, 0, "_allocator")),
+            code(.OpStore, a),
+            code(.OpLoad, v),
+            code(.OpFork, .Int(base + 40)),
+            code0(.OpPathBegin),
+            code(.OpLoad, p),
+            code0(.OpCallPc),
+            code(.OpLoad, v),
+            code0(.OpPathEnd),
+            code(.OpStore, p),
+            code(.OpForkLabel, l),
+            code(.OpLoad, v),
+            code(.OpFork, .Int(base + 37)),
+            code0(.OpPop),
+            code(.OpLoad, a),
+            code(.OpLoad, a),
+            code(.OpLoad, p),
+            code(.OpLoad, v),
+            code(.OpCall, .Call(.GetpathAlloc, 2, "getpath")),
+            code(.OpLoad, f),
+            code0(.OpCallPc),
+            code(.OpLoad, p),
+            code(.OpLoad, v),
+            code(.OpCall, .Call(.SetpathAlloc, 3, "_setpath")),
+            code(.OpStore, v),
+            code(.OpLoad, v),
+            code(.OpFork, .Int(base + 35)),
+            code(.OpJump, .Int(base + 39)),
+            code(.OpLoad, l),
+            code(.OpCall, .Call(.Break(""), 0, "_break")),
+            code(.OpLoad, p),
+            code(.OpAppend, d),
+            code0(.OpBacktrack),
+            code0(.OpPop),
+            code(.OpLoad, a),
+            code(.OpLoad, d),
+            code(.OpLoad, v),
+            code(.OpCall, .Call(.DelpathsAlloc, 2, "_delpaths")),
+            code0(.OpRet),
+        ]
+        self.codes.extend(codes)
+        self.end_builtin(setjump)
+
+    ## compileLast: `last/1` without boxing.
+    fn compile_last(&mut self) -> void:
+        setjump := self.append_builtin("_last", 1)
+        scope := self.new_scope()
+        sid := scope.id
+        v := Operand.Var(sid, 0)
+        g := Operand.Var(sid, 1)
+        x := Operand.Var(sid, 2)
+        base := self.len()
+        let codes: List[Code] = [
+            code(.OpScope, .Scope(sid, 3, 1)),
+            code(.OpStore, v),
+            code(.OpStore, g),
+            code(.OpPush, .Val(.Bool(true))),
+            code(.OpStore, x),
+            code(.OpLoad, v),
+            code(.OpFork, .Int(base + 13)),
+            code(.OpLoad, g),
+            code0(.OpCallPc),
+            code(.OpStore, v),
+            code(.OpPush, .Val(.Bool(false))),
+            code(.OpStore, x),
+            code0(.OpBacktrack),
+            code0(.OpPop),
+            code(.OpLoad, x),
+            code(.OpJumpIfNot, .Int(base + 17)),
+            code0(.OpBacktrack),
+            code(.OpLoad, v),
+            code0(.OpRet),
+        ]
+        self.codes.extend(codes)
+        self.end_builtin(setjump)
+
+    fn compile_object!(&mut self, e: *mut Object) -> Result[void, JqError] $ FsRead:
+        if e.key_vals.is_empty():
+            self.append(code(.OpConst, .Val(empty_obj())))
+            return .Ok(())
+        saved := self.new_scope_depth()
+        v := self.new_variable()
+        self.append(code(.OpStore, var_op(v)))
+        pc := self.codes.len()
+        for kv in e.key_vals:
+            self.compile_object_key_val!(v, kv)?
+        self.append(code(.OpObject, .Int(i64(e.key_vals.len()))))
+        # optimize constant objects
+        l := e.key_vals.len()
+        if pc + l * 3 + 1 == self.codes.len():
+            let all_const = true
+            for i in 0..l:
+                if self.codes[pc + i * 3].op != .OpPush || self.codes[pc + i * 3 + 1].op != .OpLoad || self.codes[pc + i * 3 + 2].op != .OpConst:
+                    all_const = false
+                    break
+            if all_const:
+                let mut w: Map[string, Value] = {}
+                for i in 0..l:
+                    match (self.codes[pc + i * 3].v, self.codes[pc + i * 3 + 2].v):
+                        (.Val(.Str(k)), .Val(val)) => w[k] = val
+                        _ => pass
+                self.codes[pc - 1] = code(.OpConst, .Val(obj(w)))
+                self.codes.truncate(pc)
+        self.end_scope_depth(saved)
+        .Ok(())
+
+    fn compile_object_key_val!(&mut self, v: (i64, i64), kv: *mut ObjectKeyVal) -> Result[void, JqError] $ FsRead:
+        key := kv.key
+        if key != "":
+            if key.starts_with("\$"):
+                if kv.val.is_none():
+                    self.append(code(.OpPush, .Val(.Str(key.slice(1, key.len())))))
+                self.append(code(.OpLoad, var_op(v)))
+                self.compile_func!(box(Func { name: key }))?
+            else:
+                self.append(code(.OpPush, .Val(.Str(key))))
+                if kv.val.is_none():
+                    self.append(code(.OpLoad, var_op(v)))
+                    self.append(code(.OpIndex, .Val(.Str(key))))
+        else:
+            match kv.key_string:
+                .Some(ks) =>
+                    match ks.queries:
+                        .None =>
+                            self.append(code(.OpPush, .Val(.Str(ks.str))))
+                            if kv.val.is_none():
+                                self.append(code(.OpLoad, var_op(v)))
+                                self.append(code(.OpIndex, .Val(.Str(ks.str))))
+                        .Some(_) =>
+                            self.append(code(.OpLoad, var_op(v)))
+                            self.compile_string!(ks, .None)?
+                            if kv.val.is_none():
+                                self.append(code0(.OpDup))
+                                self.append(code(.OpLoad, var_op(v)))
+                                self.append(code(.OpPush, .Val(.Null)))
+                                self.append(code(.OpCall, .Call(self.internal["_index"].callback, 2, "_index")))
+                .None =>
+                    match kv.key_query:
+                        .Some(kq) =>
+                            self.append(code(.OpLoad, var_op(v)))
+                            saved := self.new_scope_depth()
+                            self.compile_query!(kq)?
+                            self.end_scope_depth(saved)
+                        .None => pass
+        match kv.val:
+            .Some(val) =>
+                self.append(code(.OpLoad, var_op(v)))
+                self.compile_query!(val)?
+            .None => pass
+        .Ok(())
+
+    fn compile_array!(&mut self, e: *mut Array) -> Result[void, JqError] $ FsRead:
+        let .Some(query) = e.query else:
+            self.append(code(.OpConst, .Val(arr([]))))
+            return .Ok(())
+        self.append(code(.OpPush, .Val(arr([]))))
+        arrv := self.new_variable()
+        self.append(code(.OpStore, var_op(arrv)))
+        pc := self.codes.len()
+        setfork := self.reserve()
+        saved := self.new_scope_depth()
+        self.compile_query!(query)?
+        self.append(code(.OpAppend, var_op(arrv)))
+        self.append(code0(.OpBacktrack))
+        self.codes[setfork] = code(.OpFork, .Int(self.len()))
+        self.append(code0(.OpPop))
+        self.append(code(.OpLoad, var_op(arrv)))
+        self.end_scope_depth(saved)
+        if query.op == .OpPipe:
+            return .Ok(())
+        # optimize constant arrays
+        if (self.codes.len() - pc) % 3 != 0:
+            return .Ok(())
+        l := (self.codes.len() - pc - 3) / 3
+        for i in 0..l:
+            if self.codes[pc + i].op != .OpFork || self.codes[pc + i * 2 + l].op != .OpConst || (i < l - 1 && self.codes[pc + i * 2 + l + 1].op != .OpJump):
+                return .Ok(())
+        let mut vs: List[Value] = []
+        for i in 0..l:
+            match self.codes[pc + i * 2 + l].v:
+                .Val(x) => vs.push(x)
+                _ => vs.push(.Null)
+        self.codes[pc - 2] = code(.OpConst, .Val(arr(vs)))
+        self.codes.truncate(pc - 1)
+        .Ok(())
+
+    fn compile_unary!(&mut self, e: *mut Unary) -> Result[void, JqError] $ FsRead:
+        match unary_to_number(e):
+            .Some(v) =>
+                self.append(code(.OpConst, .Val(v)))
+                return .Ok(())
+            .None => pass
+        self.compile_term!(e.term)?
+        match e.op:
+            .OpAdd => self.compile_call!("_plus", [])
+            .OpSub => self.compile_call!("_negate", [])
+            _ => .Err(.Message("unexpected operator in Unary"))
+
+    fn compile_format!(&mut self, format: string, str: (*mut StringT)?) -> Result[void, JqError] $ FsRead:
+        let f = match format_to_func(format):
+            .Some(x) => x
+            .None => box(Func { name: "format", args: [term_query(box(Term { typ: .TermTypeString, str: .Some(box(StringT { str: format.slice(1, format.len()) })) }))] })
+        match str:
+            .None => self.compile_func!(f)
+            .Some(s) => self.compile_string!(s, .Some(f))
+
+    fn compile_string!(&mut self, s: *mut StringT, f0: (*mut Func)?) -> Result[void, JqError] $ FsRead:
+        let .Some(qs) = s.queries else:
+            self.append(code(.OpConst, .Val(.Str(s.str))))
+            return .Ok(())
+        f := f0.unwrap_or(box(Func { name: "tostring" }))
+        let q: (*mut Query)? = .None
+        for e0 in qs:
+            let e = e0
+            let is_str = match e.term:
+                .Some(t) => t.str.is_some()
+                .None => false
+            if !is_str:
+                e = box(Query { left: .Some(e), op: .OpPipe, right: .Some(term_query(box(Term { typ: .TermTypeFunc, func: .Some(f) }))) })
+            q = match q:
+                .None => .Some(e)
+                .Some(prev) => .Some(box(Query { left: .Some(prev), op: .OpAdd, right: .Some(e) }))
+        match q:
+            .Some(x) => self.compile_query!(x)
+            .None => .Ok(())
+
+    fn compile_term_suffix!(&mut self, e: *mut Term, s: *mut Suffix) -> Result[void, JqError] $ FsRead:
+        match s.index:
+            .Some(ix) => return self.compile_index!(e, ix)
+            .None => pass
+        if s.iter:
+            self.compile_term!(e)?
+            self.append(code0(.OpIter))
+            return .Ok(())
+        if s.optional:
+            let body: (*mut Term)? = if e.suffix_list.is_empty(): .None else: suffix_to_term(e.suffix_list[e.suffix_list.len() - 1])
+            match body:
+                .Some(u) =>
+                    # no need to clone (ref: compileTerm)
+                    e.suffix_list.truncate(e.suffix_list.len() - 1)
+                    self.compile_term!(e)?
+                    return self.compile_try!(box(Try { body: term_query(u) }))
+                .None => return self.compile_try!(box(Try { body: term_query(e) }))
+        .Err(.Message("invalid suffix"))
+
+    fn compile_call!(&mut self, name: string, args: List[*mut Query]) -> Result[void, JqError] $ FsRead:
+        fun := self.internal.get(name).expect("internal function")
+        let indexing = -1i64
+        if name == "_index" || name == "_slice":
+            indexing = 1
+        else if name == "getpath":
+            indexing = 0
+        self.compile_call_internal!(.Call(fun.callback, i64(args.len()), name), args, true, indexing)?
+        if fun.iter:
+            self.append(code0(.OpIter))
+        .Ok(())
+
+    fn compile_call_pc!(&mut self, f: *mut FuncInfo, args: List[*mut Query]) -> Result[void, JqError] $ FsRead:
+        self.compile_call_internal!(.Int(f.pc), args, false, -1)
+
+    fn compile_call_internal!(&mut self, f: Operand, args: List[*mut Query], internal: bool, indexing: i64) -> Result[void, JqError] $ FsRead:
+        if args.is_empty():
+            self.append(code(.OpCall, f))
+            return .Ok(())
+        v := self.new_variable()
+        self.append(code(.OpStore, var_op(v)))
+        if indexing >= 0:
+            self.append(code0(.OpExpBegin))
+        let i = args.len()
+        while i > 0:
+            i -= 1
+            pc := self.len() + 1
+            name := "lambda:$pc"
+            self.compile_func_def!(box(FuncDef { name: name, body: args[i] }), false)?
+            if internal:
+                n := self.len() - pc
+                if n == 2:
+                    # optimize identity argument (opscope, opret)
+                    j := self.codes.len() - 3
+                    self.codes[j] = code(.OpLoad, var_op(v))
+                    self.codes.truncate(j + 1)
+                    s := self.scopes[self.scopes.len() - 1]
+                    _ := s.funcs.pop()
+                else if n == 3:
+                    # optimize one instruction argument (opscope, opX, opret)
+                    j := self.codes.len() - 4
+                    if self.codes[j + 2].op == .OpConst:
+                        self.codes[j] = code(.OpPush, self.codes[j + 2].v)
+                        self.codes.truncate(j + 1)
+                    else:
+                        self.codes[j] = code(.OpLoad, var_op(v))
+                        self.codes[j + 1] = self.codes[j + 2]
+                        self.codes.truncate(j + 2)
+                    s := self.scopes[self.scopes.len() - 1]
+                    _ := s.funcs.pop()
+                else:
+                    self.append(code(.OpLoad, var_op(v)))
+                    self.append(code(.OpPushPc, .Int(pc)))
+                    self.append(code0(.OpCallPc))
+            else:
+                self.append(code(.OpPushPc, .Int(pc)))
+            if i64(i) == indexing:
+                n := self.codes.len()
+                if self.codes[n - 2].op == .OpExpBegin:
+                    self.codes[n - 2] = self.codes[n - 1]
+                    self.codes.truncate(n - 1)
+                else:
+                    self.append(code0(.OpExpEnd))
+        if indexing > 0:
+            self.append(code(.OpPush, .Val(.Null)))
+        else:
+            self.append(code(.OpLoad, var_op(v)))
+        self.append(code(.OpCall, f))
+        .Ok(())
+
+    fn optimize_tail_rec(&mut self) -> void:
+        let mut pcs: List[i64] = []
+        let mut scopes: Map[i64, bool] = {}
+        let i = 0usize
+        while i < self.codes.len():
+            c := self.codes[i]
+            match c.op:
+                .OpScope =>
+                    pcs.push(i64(i))
+                    match c.v:
+                        .Scope(_, cnt, args) =>
+                            if args == 0:
+                                scopes[i64(i)] = cnt == 0
+                        _ => pass
+                .OpCall =>
+                    match c.v:
+                        .Int(j) =>
+                            if !pcs.is_empty() && pcs[pcs.len() - 1] == j:
+                                match scopes.get(j):
+                                    .Some(canjump) =>
+                                        let k = i + 1
+                                        while k < self.codes.len():
+                                            match self.codes[k].op:
+                                                .OpJump =>
+                                                    match self.codes[k].v:
+                                                        .Int(t) => k = usize(t)
+                                                        _ => break
+                                                .OpRet =>
+                                                    if canjump:
+                                                        self.codes[i] = code(.OpJump, .Int(pcs[pcs.len() - 1] + 1))
+                                                    else:
+                                                        self.codes[i].op = .OpCallRec
+                                                    break
+                                                _ => break
+                                    .None => pass
+                        _ => pass
+                .OpRet =>
+                    if pcs.is_empty():
+                        break
+                    _ := pcs.pop()
+                _ => pass
+            i += 1
+
+    fn optimize_code_ops(&mut self) -> void:
+        let i = self.codes.len()
+        let next: usize? = .None
+        while i > 0:
+            i -= 1
+            c := self.codes[i]
+            match c.op:
+                .OpPush => self.fold_with_next(i, next)
+                .OpDup => self.fold_with_next(i, next)
+                .OpLoad => self.fold_with_next(i, next)
+                .OpJump => self.thread_jump(i)
+                .OpJumpIfNot => self.thread_jump(i)
+                _ => pass
+            next = .Some(i)
+
+    fn fold_with_next(&mut self, i: usize, next: usize?) -> void:
+        let .Some(n) = next else: return
+        match self.codes[n].op:
+            .OpPop =>
+                self.codes[i].op = .OpNop
+                self.codes[n].op = .OpNop
+            .OpConst =>
+                self.codes[i].op = .OpNop
+                self.codes[n].op = .OpPush
+            _ => pass
+
+    fn thread_jump(&mut self, i: usize) -> void:
+        let .Int(j) = self.codes[i].v else: return
+        if j - 1 == i64(i):
+            self.codes[i].op = .OpNop
+        else if self.codes[usize(j)].op == .OpJump:
+            self.codes[i].v = self.codes[usize(j)].v
+
+## What compilePatterns runs after binding (its `body` closure).
+enum PatternBody:
+    Bind(r: *mut Query)
+    ReduceBody(v: (i64, i64), update: *mut Query)
+    ForeachBody(v: (i64, i64), update: *mut Query, extract: (*mut Query)?)
+
+fn format_to_func(format: string) -> (*mut Func)?:
+    let name = match format:
+        "@text" => "tostring"
+        "@json" => "tojson"
+        "@html" => "_tohtml"
+        "@uri" => "_touri"
+        "@urid" => "_tourid"
+        "@csv" => "_tocsv"
+        "@tsv" => "_totsv"
+        "@sh" => "_tosh"
+        "@base64" => "_tobase64"
+        "@base64d" => "_tobase64d"
+        _ => ""
+    if name == "":
+        return .None
+    .Some(box(Func { name: name }))
+
+# ---------------------------------------------------------------- runtime callbacks
+
+fn by_name_arity(x: (string, i64), y: (string, i64)) -> Ordering:
+    if x._0 < y._0: Ordering.Less else if x._0 > y._0: Ordering.Greater else if x._1 < y._1: Ordering.Less else if x._1 > y._1: Ordering.Greater else: Ordering.Equal
+
+fn push_arities(xs: &mut List[(string, i64)], name: string, argcount: i64) -> void:
+    let i = 0i64
+    let cnt = argcount
+    while cnt > 0:
+        if cnt & 1 > 0:
+            xs.push((name, i))
+        i += 1
+        cnt = cnt >> 1
+
+## compiler.funcBuiltins
+fn func_builtins(rt: *mut Runtime) -> Value:
+    let mut xs: List[(string, i64)] = []
+    for (_, fds) in rt.builtin_defs:
+        for fd in fds:
+            if !fd.name.starts_with("_"):
+                xs.push((fd.name, i64(fd.args.len())))
+    for (name, fun) in internal_funcs():
+        if !name.starts_with("_"):
+            push_arities(&mut xs, *name, fun.argcount)
+    for (name, fun) in rt.custom_funcs:
+        if !name.starts_with("_"):
+            push_arities(&mut xs, *name, fun.argcount)
+    xs.sort_by(fn(x, y): by_name_arity(*x, *y))
+    arr([for (n, a) in xs => Value.Str("$n/$a")])
+
+fn val(x: Item) -> Value:
+    match x:
+        .V(v) => v
+        _ => Value.Null
+
+## Calls the native callback of an `opcall`: the Go closures of gojq. The
+## callbacks that read input, load modules, read the clock or are given with
+## WithFunction (which may write) wait or need the host; the others are
+## plain calls.
+pub fn call_callback!(rt: *mut Runtime, f: Callback, x: Item, args: List[Item]) -> Item $ Console + ConsoleInput + FsRead + FsWrite + Clock:
+    match f:
+        .Custom(name) =>
+            match rt.custom:
+                .Some(c) => c.call!(name, val(x), [for a in args => val(a)])
+                .None => .Err(.FuncNotFound(name, i64(args.len())))
+        .Input => func_input!(rt)
+        .Modulemeta => func_modulemeta!(rt, x)
+        .Local("now") => func_now(now().unix_milliseconds() * 1000000)
+        _ => call_callback_pure(rt, f, x, args)
+
+## compiler.funcInput
+fn func_input!(rt: *mut Runtime) -> Item $ ConsoleInput + FsRead:
+    match rt.input_iter:
+        .Some(it) =>
+            match it.next!():
+                .Some(v) => v
+                .None => .Err(.Message("break"))
+        .None => .Err(.InputNotAllowed)
+
+## The callbacks that need no input, files or clock.
+pub fn call_callback_pure(rt: *mut Runtime, f: Callback, x: Item, args: List[Item]) -> Item $ Console:
+    match f:
+        .Arg0(g) => g(val(x))
+        .Arg1(g) => g(val(x), val(args[0]))
+        .Arg2(g) => g(val(x), val(args[0]), val(args[1]))
+        .Arg3(g) => g(val(x), val(args[0]), val(args[1]), val(args[2]))
+        .Args(g) => g(val(x), [for a in args => val(a)])
+        .Math1(name, g) => call_math1(name, g, val(x))
+        .Math2(name, g) => call_math2(name, g, val(args[0]), val(args[1]))
+        .Math3(name, g) => call_math3(name, g, val(args[0]), val(args[1]), val(args[2]))
+        .Break(label) => .Err(.Break(label, val(x)))
+        .Builtins => .V(func_builtins(rt))
+        .Match => func_match(val(x), val(args[0]), val(args[1]), val(args[2]), rt.regexp_cache)
+        .Allocator => func_allocator()
+        .SetpathAlloc => func_setpath_with_allocator(x, args)
+        .GetpathAlloc => func_getpath_with_allocator(x, args)
+        .DelpathsAlloc => func_delpaths_with_allocator(x, args)
+        .Local(name) => call_local(name, val(x), [for a in args => val(a)], local())
+        _ => .Err(.Message("unexpected callback"))
+
+fn func_modulemeta!(rt: *mut Runtime, x: Item) -> Item $ FsRead:
+    let .V(v) = x else: return .Err(.Message("modulemeta"))
+    let .Str(s) = v else: return .Err(.Func0Type("modulemeta", v))
+    let .Some(loader) = rt.module_loader else:
+        return .Err(.Message("cannot load module: ${quote(s)}"))
+    q := match loader.load_module_with_meta!(s, .None):
+        .Ok(q) => q
+        .Err(e) => return .Err(e)
+    let mut meta: Map[string, Value] = match q.meta:
+        .Some(m) => const_object_to_value(m)
+        .None => {}
+    meta["defs"] = list_module_defs(q)
+    meta["deps"] = list_module_deps(q)
+    .V(obj(meta))
+
+fn list_module_defs(q: *mut Query) -> Value:
+    let mut xs: List[(string, i64)] = []
+    for fd in q.func_defs:
+        if !fd.name.starts_with("_"):
+            xs.push((fd.name, i64(fd.args.len())))
+    xs.sort_by(fn(x, y): by_name_arity(*x, *y))
+    arr([for (n, a) in xs => Value.Str("$n/$a")])
+
+fn list_module_deps(q: *mut Query) -> Value:
+    let mut deps: List[Value] = []
+    for i in q.imports:
+        let mut v: Map[string, Value] = match i.meta:
+            .Some(m) => const_object_to_value(m)
+            .None => {}
+        v["relpath"] = .Str(if i.import_path != "": i.import_path else: i.include_path)
+        if i.import_alias != "":
+            v["as"] = .Str(i.import_alias.strip_prefix("\$").unwrap_or(i.import_alias))
+        v["is_data"] = .Bool(i.import_alias.starts_with("\$"))
+        deps.push(obj(v))
+    arr(deps)

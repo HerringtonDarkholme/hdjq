@@ -1,0 +1,11 @@
+## Port of gojq/cmd/gojq/main.go.
+use std.cli.{Args, args}
+use std.console.ConsoleInput
+use std.fs.{FsRead, FsWrite}
+use std.time.Clock
+use std.host.Env
+use std.process.ExitCode
+use pkg.cli.cli.run
+
+pub fn main!() -> ExitCode $ Console + ConsoleInput + FsRead + FsWrite + Clock + Env + Args:
+    ExitCode(u8(run!(args())))

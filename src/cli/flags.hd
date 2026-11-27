@@ -1,0 +1,247 @@
+## Port of gojq/cli/flags.go. Go walks the struct tags of flagopts with
+## reflection; here the same tags are a table, and a flag's kind says how
+## its value is stored (the reflect.Kind of the field).
+use std.text.StringBuilder
+use pkg.goshim.strconv.quote
+
+pub enum FlagKind:
+    Bool
+    ## *int
+    Int
+    ## []string
+    Slice
+    ## map[string]string
+    Map
+    ## []any with the `positional` tag
+    Positional
+
+pub struct FlagSpec:
+    pub short: string
+    pub long: string
+    pub args: string
+    pub description: string
+    pub kind: FlagKind
+
+pub fn flag_specs() -> List[FlagSpec]:
+    [
+        FlagSpec { short: "r", long: "raw-output", args: "", description: "output raw strings", kind: .Bool },
+        FlagSpec { short: "", long: "raw-output0", args: "", description: "implies -r with NUL character delimiter", kind: .Bool },
+        FlagSpec { short: "j", long: "join-output", args: "", description: "implies -r with no newline delimiter", kind: .Bool },
+        FlagSpec { short: "c", long: "compact-output", args: "", description: "output without pretty-printing", kind: .Bool },
+        FlagSpec { short: "", long: "indent", args: "number", description: "number of spaces for indentation", kind: .Int },
+        FlagSpec { short: "", long: "tab", args: "", description: "use tabs for indentation", kind: .Bool },
+        FlagSpec { short: "C", long: "color-output", args: "", description: "output with colors even if piped", kind: .Bool },
+        FlagSpec { short: "M", long: "monochrome-output", args: "", description: "output without colors", kind: .Bool },
+        FlagSpec { short: "n", long: "null-input", args: "", description: "use null as input value", kind: .Bool },
+        FlagSpec { short: "R", long: "raw-input", args: "", description: "read input as raw strings", kind: .Bool },
+        FlagSpec { short: "", long: "stream", args: "", description: "parse input in stream fashion", kind: .Bool },
+        FlagSpec { short: "s", long: "slurp", args: "", description: "read all inputs into an array", kind: .Bool },
+        FlagSpec { short: "f", long: "from-file", args: "", description: "load query from file", kind: .Bool },
+        FlagSpec { short: "L", long: "library-path", args: "dir", description: "directory to search modules from", kind: .Slice },
+        FlagSpec { short: "", long: "arg", args: "name value", description: "set a string value to a variable", kind: .Map },
+        FlagSpec { short: "", long: "argjson", args: "name value", description: "set a JSON value to a variable", kind: .Map },
+        FlagSpec { short: "", long: "slurpfile", args: "name file", description: "set the JSON contents of a file to a variable", kind: .Map },
+        FlagSpec { short: "", long: "rawfile", args: "name file", description: "set the contents of a file to a variable", kind: .Map },
+        FlagSpec { short: "", long: "args", args: "", description: "consume remaining arguments as positional string values", kind: .Positional },
+        FlagSpec { short: "", long: "jsonargs", args: "", description: "consume remaining arguments as positional JSON values", kind: .Positional },
+        FlagSpec { short: "e", long: "exit-status", args: "", description: "exit 1 when the last value is false or null", kind: .Bool },
+        FlagSpec { short: "v", long: "version", args: "", description: "display version information", kind: .Bool },
+        FlagSpec { short: "h", long: "help", args: "", description: "display this help information", kind: .Bool },
+    ]
+
+## flagopts: the values, by long flag name.
+pub struct FlagOpts:
+    pub bools: Map[string, bool] = {}
+    pub ints: Map[string, i64] = {}
+    pub slices: Map[string, List[string]] = {}
+    ## map flags keep the order the names first appear
+    pub maps: Map[string, List[(string, string)]] = {}
+    ## positional slices; `.None` is a nil element
+    pub positionals: Map[string, List[string?]] = {}
+
+impl FlagOpts:
+    pub fn flag(&self, long: string) -> bool:
+        self.bools.get(long).unwrap_or(false)
+
+    pub fn int(&self, long: string) -> i64?:
+        self.ints.get(long)
+
+    pub fn slice(&self, long: string) -> List[string]:
+        self.slices.get(long).unwrap_or([])
+
+    pub fn pairs(&self, long: string) -> List[(string, string)]:
+        self.maps.get(long).unwrap_or([])
+
+    pub fn positional(&self, long: string) -> List[string?]:
+        self.positionals.get(long).unwrap_or([])
+
+fn find_long(specs: List[FlagSpec], long: string) -> FlagSpec?:
+    for s in specs:
+        if s.long == long:
+            return .Some(s)
+    .None
+
+fn find_short(specs: List[FlagSpec], short: string) -> FlagSpec?:
+    for s in specs:
+        if s.short != "" && s.short == short:
+            return .Some(s)
+    .None
+
+fn is_bool(s: FlagSpec) -> bool:
+    match s.kind:
+        .Bool => true
+        _ => false
+
+fn is_letter(opt: string) -> bool:
+    ("A" <= opt && opt <= "Z") || ("a" <= opt && opt <= "z")
+
+## parseFlags: returns the rest arguments.
+pub fn parse_flags(args0: List[string], opts: &mut FlagOpts) -> Result[List[string], string]:
+    specs := flag_specs()
+    let mut args = args0
+    let mut rest: List[string] = []
+    let mut map_keys: Map[string, bool] = {}
+    let positional_val: string? = .None
+    let opts_done = false
+    let i = 0i64
+    while i < i64(args.len()):
+        let arg = args[usize(i)]
+        let val: FlagSpec? = .None
+        let shortopts = ""
+        let go_l = false
+        if opts_done:
+            pass
+        else if arg == "--":
+            opts_done = true
+            i += 1
+            continue
+        else if arg.starts_with("--"):
+            val = find_long(specs, arg.slice(2, arg.len()))
+            if val.is_none():
+                match arg.find("="):
+                    .Some(j) =>
+                        val = find_long(specs, arg.slice(2, j))
+                        match val:
+                            .Some(v) =>
+                                if is_bool(v):
+                                    return .Err("boolean flag `${arg.slice(0, j)}' cannot have an argument")
+                                args[usize(i)] = arg.slice(j + 1, arg.len())
+                                arg = arg.slice(0, j)
+                                i -= 1
+                            .None => pass
+                    .None => pass
+                if val.is_none():
+                    return .Err("unknown flag `$arg'")
+        else if arg.len() > 1 && arg.starts_with("-"):
+            let skip = false
+            for k in 1..arg.len():
+                opt := arg.slice(k, k + 1)
+                val = find_short(specs, opt)
+                match val:
+                    .Some(v) =>
+                        if !is_bool(v):
+                            break
+                    .None =>
+                        if !is_letter(opt):
+                            skip = true
+                            break
+            if !skip && (arg.len() > 2 || val.is_none()):
+                shortopts = arg.slice(1, arg.len())
+                go_l = true
+        if !go_l && val.is_none():
+            match positional_val:
+                .Some(p) =>
+                    if !rest.is_empty():
+                        let mut xs = opts.positional(p)
+                        xs.push(.Some(arg))
+                        opts.positionals[p] = xs
+                    else:
+                        rest.push(arg)
+                .None => rest.push(arg)
+            i += 1
+            continue
+        # S: store the flag value; L: take the next short option
+        let do_s = !go_l
+        while true:
+            if do_s:
+                let .Some(spec) = val else: break
+                match spec.kind:
+                    .Bool => opts.bools[spec.long] = true
+                    .Int =>
+                        i += 1
+                        if i >= i64(args.len()):
+                            return .Err("expected argument for flag `$arg'")
+                        match args[usize(i)].parse::[i64]():
+                            .Ok(v) => opts.ints[spec.long] = v
+                            .Err(_) => return .Err("invalid argument for flag `$arg': strconv.Atoi: parsing ${go_quote(args[usize(i)])}: invalid syntax")
+                    .Slice =>
+                        i += 1
+                        if i >= i64(args.len()):
+                            return .Err("expected argument for flag `$arg'")
+                        let mut xs = opts.slice(spec.long)
+                        xs.push(args[usize(i)])
+                        opts.slices[spec.long] = xs
+                    .Positional =>
+                        match positional_val:
+                            .Some(p) =>
+                                let mut xs = opts.positional(spec.long)
+                                n := opts.positional(p).len()
+                                while n > xs.len():
+                                    xs.push(.None)
+                                opts.positionals[spec.long] = xs
+                            .None => opts.positionals[spec.long] = opts.positional(spec.long)
+                        positional_val = .Some(spec.long)
+                    .Map =>
+                        i += 2
+                        if i >= i64(args.len()):
+                            return .Err("expected 2 arguments for flag `$arg'")
+                        name := args[usize(i - 1)]
+                        if !map_keys.contains_key(name):
+                            map_keys[name] = true
+                            let mut xs = opts.pairs(spec.long)
+                            xs.push((name, args[usize(i)]))
+                            opts.maps[spec.long] = xs
+            do_s = true
+            if shortopts == "":
+                break
+            opt := shortopts.slice(0, 1)
+            val = find_short(specs, opt)
+            let .Some(spec) = val else: return .Err("unknown flag `$opt'")
+            if !is_bool(spec) && shortopts.len() > 1:
+                if shortopts.slice(1, 2) == "=":
+                    args[usize(i)] = shortopts.slice(2, shortopts.len())
+                else:
+                    args[usize(i)] = shortopts.slice(1, shortopts.len())
+                i -= 1
+                shortopts = ""
+            else:
+                shortopts = shortopts.slice(1, shortopts.len())
+            arg = "-" + opt
+        i += 1
+    .Ok(rest)
+
+fn go_quote(s: string) -> string:
+    quote(s)
+
+## formatFlags
+pub fn format_flags() -> string:
+    specs := flag_specs()
+    sb := StringBuilder::new()
+    sb.push("Command Options:\n")
+    for (i, spec) in specs.iter().enumerate():
+        if i == specs.len() - 1:
+            sb.push("\nHelp Option:\n")
+        let line = "  "
+        let short = false
+        if spec.short != "":
+            line = line + "-" + spec.short
+            short = true
+        else:
+            line = line + "  "
+        m := line.len()
+        line = line + (if short: ", " else: "  ") + "--" + spec.long
+        if spec.args != "":
+            line = line + " " + spec.args
+        line = line + " ".repeat(24 - (line.len() - m))
+        sb.push(line + spec.description + "\n")
+    sb.build()

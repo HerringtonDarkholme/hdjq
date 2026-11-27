@@ -1,0 +1,859 @@
+## Port of github.com/itchyny/timefmt-go (format.go and parse.go). Go's
+## `goto L` re-dispatches a format byte; here a loop re-runs the dispatch.
+use pkg.goshim.time.{Time, Location, utc, date, unix, fixed_zone, parse_zone_name}
+use pkg.goshim.strconv.{quote, quote_rune}
+
+PADDING_MASK := i64(0x7F)
+NO_PAD := i64(0x80)
+
+fn long_month_names() -> List[string]:
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+fn short_month_names() -> List[string]:
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+fn long_week_names() -> List[string]:
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+fn short_week_names() -> List[string]:
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+fn or(x: i64, y: i64) -> i64:
+    if x != 0: x else: y
+
+fn abs(x: i64) -> i64:
+    if x >= 0: x else: -x
+
+fn imax(x: i64, y: i64) -> i64:
+    if x > y: x else: y
+
+fn imin(x: i64, y: i64) -> i64:
+    if x < y: x else: y
+
+fn bytes_of(s: string) -> List[u8]:
+    s.bytes().collect()
+
+fn to_string(b: List[u8]) -> string:
+    string::from_utf8(b).unwrap_or("")
+
+# ---------------------------------------------------------------- format
+
+## Format time to string using the format.
+pub fn format(t: Time, fmt: string) -> string:
+    let mut buf: List[u8] = []
+    append_format(&mut buf, t, bytes_of(fmt))
+    to_string(buf)
+
+fn append_format(buf: &mut List[u8], t: Time, format: List[u8]) -> void:
+    let (year, month, day) = t.date()
+    let (hour, minute, second) = t.clock()
+    let width = 0i64
+    let colons = 0i64
+    let padding = i64(0x30)
+    let mut pending: List[u8] = []
+    let upper = false
+    let swap = false
+    n := format.len()
+    let i = 0usize
+    while i < n:
+        let b = format[i]
+        if b != 0x25:
+            buf.push(b)
+            i += 1
+            continue
+        i += 1
+        if i == n:
+            buf.push(0x25)
+            break
+        b = format[i]
+        width = 0
+        padding = 0x30
+        upper = false
+        swap = false
+        let dispatch = true
+        while dispatch:
+            dispatch = false
+            let redo = false
+            match b:
+                0x2d =>
+                    # '-'
+                    if !pending.is_empty():
+                        buf.push(0x2d)
+                    else:
+                        i += 1
+                        if i == n:
+                            append_last(buf, format, width, padding)
+                            return
+                        padding = NO_PAD
+                        b = format[i]
+                        redo = true
+                0x5f =>
+                    # '_'
+                    i += 1
+                    if i == n:
+                        append_last(buf, format, width, padding)
+                        return
+                    padding = 0x20 | NO_PAD
+                    b = format[i]
+                    redo = true
+                0x5e =>
+                    # '^'
+                    i += 1
+                    if i == n:
+                        append_last(buf, format, width, padding)
+                        return
+                    upper = true
+                    b = format[i]
+                    redo = true
+                0x23 =>
+                    # '#'
+                    i += 1
+                    if i == n:
+                        append_last(buf, format, width, padding)
+                        return
+                    swap = true
+                    b = format[i]
+                    redo = true
+                0x30 =>
+                    # '0'
+                    i += 1
+                    if i == n:
+                        append_last(buf, format, width, padding)
+                        return
+                    padding = 0x30 | NO_PAD
+                    b = format[i]
+                    redo = true
+                0x59 => append_int(buf, year, or(width, 4), padding)
+                0x79 => append_int(buf, abs(year % 100), imax(width, 2), padding)
+                0x43 =>
+                    let c = year / 100
+                    z := year < 0 && c == 0
+                    if z:
+                        c = -1
+                    append_int(buf, c, imax(width, 2), padding)
+                    if z:
+                        l := buf.len()
+                        buf[l - 1] = 0x30
+                0x67 =>
+                    let (y, _) = t.iso_week()
+                    append_int(buf, abs(y % 100), imax(width, 2), padding)
+                0x47 =>
+                    let (y, _) = t.iso_week()
+                    append_int(buf, y, or(width, 4), padding)
+                0x6d => append_int(buf, month, imax(width, 2), padding)
+                0x42 => append_string(buf, long_month_names()[usize(month - 1)], width, padding, upper, swap)
+                0x62 => append_string(buf, short_month_names()[usize(month - 1)], width, padding, upper, swap)
+                0x68 => append_string(buf, short_month_names()[usize(month - 1)], width, padding, upper, swap)
+                0x41 => append_string(buf, long_week_names()[usize(t.weekday())], width, padding, upper, swap)
+                0x61 => append_string(buf, short_week_names()[usize(t.weekday())], width, padding, upper, swap)
+                0x77 => append_int(buf, t.weekday(), width, padding)
+                0x75 => append_int(buf, or(t.weekday(), 7), width, padding)
+                0x56 =>
+                    let (_, week) = t.iso_week()
+                    append_int(buf, week, imax(width, 2), padding)
+                0x55 =>
+                    week := (t.year_day() + 6 - t.weekday()) / 7
+                    append_int(buf, week, imax(width, 2), padding)
+                0x57 =>
+                    let week = t.year_day()
+                    if t.weekday() > 0:
+                        week -= t.weekday() - 7
+                    week = week / 7
+                    append_int(buf, week, imax(width, 2), padding)
+                0x65 =>
+                    if padding < NO_PAD:
+                        padding = 0x20
+                    append_int(buf, day, imax(width, 2), padding)
+                0x64 => append_int(buf, day, imax(width, 2), padding)
+                0x6a => append_int(buf, t.year_day(), imax(width, 3), padding)
+                0x6b =>
+                    if padding < NO_PAD:
+                        padding = 0x20
+                    append_int(buf, hour, imax(width, 2), padding)
+                0x48 => append_int(buf, hour, imax(width, 2), padding)
+                0x6c =>
+                    if padding < NO_PAD:
+                        padding = 0x20
+                    append_int(buf, or(hour % 12, 12), imax(width, 2), padding)
+                0x49 => append_int(buf, or(hour % 12, 12), imax(width, 2), padding)
+                0x50 =>
+                    swap = !upper && !swap
+                    append_string(buf, if hour < 12: "AM" else: "PM", width, padding, upper, swap)
+                0x70 => append_string(buf, if hour < 12: "AM" else: "PM", width, padding, upper, swap)
+                0x4d => append_int(buf, minute, imax(width, 2), padding)
+                0x53 => append_int(buf, second, imax(width, 2), padding)
+                0x73 =>
+                    if padding < NO_PAD:
+                        padding = 0x20
+                    append_int64(buf, t.unix(), width, padding)
+                0x66 => append_int(buf, t.nanosecond() / 1000, or(width, 6), padding)
+                0x5a =>
+                    let (name, offset) = t.zone()
+                    if name != "":
+                        append_string(buf, name, width, padding, upper, swap)
+                    else:
+                        append_zone(buf, offset, width, padding, colons)
+                        colons = 0
+                0x7a =>
+                    let (_, offset) = t.zone()
+                    append_zone(buf, offset, width, padding, colons)
+                    colons = 0
+                0x3a =>
+                    # ':'
+                    if !pending.is_empty():
+                        buf.push(0x3a)
+                    else:
+                        colons = 1
+                        let to_z = false
+                        i += 1
+                        while i < n:
+                            c := format[i]
+                            if c == 0x3a:
+                                colons += 1
+                            else if c == 0x7a:
+                                if colons > 3:
+                                    i += 1
+                                    break
+                                b = 0x7a
+                                to_z = true
+                                break
+                            else:
+                                break
+                            i += 1
+                        if to_z:
+                            redo = true
+                        else:
+                            append_last(buf, format.slice(0, i), width, padding)
+                            i -= 1
+                            colons = 0
+                0x74 => append_string(buf, "\t", width, padding, false, false)
+                0x6e => append_string(buf, "\n", width, padding, false, false)
+                0x25 => append_string(buf, "%", width, padding, false, false)
+                0x63 =>
+                    pending = bytes_of("a b e H:M:S Y")
+                    swap = false
+                0x2b =>
+                    pending = bytes_of("a b e H:M:S Z Y")
+                    swap = false
+                0x76 =>
+                    pending = bytes_of("e-b-Y")
+                    swap = false
+                0x72 =>
+                    pending = bytes_of("I:M:S p")
+                    swap = false
+                0x46 => pending = bytes_of("Y-m-d")
+                0x44 => pending = bytes_of("m/d/y")
+                0x78 => pending = bytes_of("m/d/y")
+                0x54 => pending = bytes_of("H:M:S")
+                0x58 => pending = bytes_of("H:M:S")
+                0x52 => pending = bytes_of("H:M")
+                _ =>
+                    if b >= 0x31 && b <= 0x39:
+                        width = i64(b & 0x0F)
+                        i += 1
+                        while i < n:
+                            b = format[i]
+                            if b <= 0x39 && 0x30 <= b:
+                                width = imin(width * 10 + i64(b & 0x0F), 1024)
+                            else:
+                                break
+                            i += 1
+                        if padding == NO_PAD:
+                            padding = 0x20 | NO_PAD
+                        if i == n:
+                            append_last(buf, format, width, padding)
+                            return
+                        redo = true
+                    else:
+                        if pending.is_empty():
+                            append_last(buf, format.slice(0, i), width - 1, padding)
+                        buf.push(b)
+            if redo:
+                dispatch = true
+            else if !pending.is_empty():
+                b = pending[0]
+                pending = pending.slice(1, pending.len())
+                width = 0
+                padding = 0x30
+                dispatch = true
+        i += 1
+
+fn append_zone(buf: &mut List[u8], offset0: i64, width0: i64, padding: i64, colons: i64) -> void:
+    let offset = offset0
+    let width = width0
+    i := buf.len()
+    if padding != NO_PAD:
+        while width > 1:
+            buf.push(u8(padding & PADDING_MASK))
+            width -= 1
+    j := buf.len()
+    if offset < 0:
+        buf.push(0x2d)
+        offset = -offset
+    else:
+        buf.push(0x2b)
+    k0 := buf.len()
+    append_int(buf, offset / 3600, 2, padding)
+    if buf[k0] == 0x20:
+        x := buf[k0 - 1]
+        buf[k0 - 1] = buf[k0]
+        buf[k0] = x
+    offset = offset % 3600
+    if colons <= 2 || offset != 0:
+        if colons != 0:
+            buf.push(0x3a)
+        append_int(buf, offset / 60, 2, 0x30)
+        offset = offset % 60
+        if colons == 2 || colons == 3 && offset != 0:
+            buf.push(0x3a)
+            append_int(buf, offset, 2, 0x30)
+    k := imin(i64(buf.len() - j) - 1, i64(j - i))
+    if k > 0:
+        ku := usize(k)
+        let mut rest = buf.slice(j, buf.len())
+        buf.truncate(j - ku)
+        buf.extend(rest)
+        if (padding & PADDING_MASK) == 0x30:
+            x := buf[i]
+            buf[i] = buf[j - ku]
+            buf[j - ku] = x
+
+fn append_digits(buf: &mut List[u8], num: i64) -> void:
+    for c in "$num".bytes():
+        buf.push(c)
+
+fn append_int(buf: &mut List[u8], num: i64, width0: i64, padding0: i64) -> void:
+    if num < 0 || num >= 10000:
+        append_int64(buf, num, width0, padding0)
+        return
+    if num < 100 && width0 == 2 && padding0 == 0x30:
+        buf.push(u8(0x30 + num / 10))
+        buf.push(u8(0x30 + num % 10))
+        return
+    digits := if num < 10: 1i64 else if num < 100: 2 else if num < 1000: 3 else: 4
+    let width = width0
+    if padding0 != NO_PAD:
+        p := u8(padding0 & PADDING_MASK)
+        while width > digits:
+            buf.push(p)
+            width -= 1
+    append_digits(buf, num)
+
+fn append_int64(buf: &mut List[u8], num: i64, width0: i64, padding0: i64) -> void:
+    if padding0 == NO_PAD:
+        append_digits(buf, num)
+        return
+    p := u8(padding0 & PADDING_MASK)
+    i := buf.len()
+    let width = width0
+    while width > 1:
+        buf.push(p)
+        width -= 1
+    j0 := buf.len()
+    append_digits(buf, num)
+    k := imin(i64(buf.len() - j0) - 1, i64(j0 - i))
+    if k > 0:
+        ku := usize(k)
+        rest := buf.slice(j0, buf.len())
+        buf.truncate(j0 - ku)
+        buf.extend(rest)
+        j := j0 - ku
+        if buf[i] == 0x30 && buf[j] == 0x2d:
+            buf[i] = 0x2d
+            buf[j] = 0x30
+
+fn append_string(buf: &mut List[u8], str: string, width0: i64, padding0: i64, upper: bool, swap: bool) -> void:
+    s := bytes_of(str)
+    let width = width0
+    if width > i64(s.len()) && padding0 != NO_PAD:
+        p := if padding0 < NO_PAD: u8(0x20) else: u8(padding0 & PADDING_MASK)
+        width -= i64(s.len())
+        while width > 0:
+            buf.push(p)
+            width -= 1
+    let up = upper
+    if swap:
+        if s[if s.len() > 1: 1 else: s.len() - 1] < 0x61:
+            for c in s:
+                buf.push(if 0x41 <= c && c <= 0x5a: c + 0x20 else: c)
+            return
+        up = true
+    if up:
+        for c in s:
+            buf.push(if 0x61 <= c && c <= 0x7a: c - 0x20 else: c)
+        return
+    buf.extend(s)
+
+fn append_last(buf: &mut List[u8], format: List[u8], width: i64, padding: i64) -> void:
+    let i = format.len()
+    while i > 0:
+        i -= 1
+        if format[i] == 0x25:
+            append_string(buf, to_string(format.slice(i, format.len())), width, padding, false, false)
+            break
+
+# ---------------------------------------------------------------- parse
+
+## Parse time string using the format; time.Local is `base`.
+pub fn parse(source: string, format: string, base: *mut Location) -> Result[Time, string]:
+    match parse_time(bytes_of(source), bytes_of(format), utc(), base):
+        .Ok(t) => .Ok(t)
+        .Err(e) => .Err("failed to parse ${quote(source)} with ${quote(format)}: $e")
+
+fn parse_format_error(b: u8) -> string:
+    "cannot parse \"%${to_string([b])}\""
+
+fn expected_format_error(r: char) -> string:
+    "expected ${quote_rune(r)}"
+
+fn colon_text(n: i64, tail: string) -> string:
+    ":::".slice(0, usize(n)) + tail
+
+fn parse_z_format_error(colons: i64) -> string:
+    "cannot parse \"%" + colon_text(colons, "z\"")
+
+fn expected_colon_error(colons: i64) -> string:
+    "expected ':' for \"%" + colon_text(colons, "z\"")
+
+fn expected_z_after_colon_error(colons: i64) -> string:
+    "expected 'z' after \"%" + colon_text(colons, "\"")
+
+fn rune_at(b: List[u8], i: usize) -> char:
+    s := to_string(b.slice(i, b.len()))
+    match s.chars().next():
+        .Some(c) => c
+        .None => '\u{FFFD}'
+
+fn parse_sign(source: List[u8], index: usize, l: usize) -> (i64, usize):
+    if index < l && source[index] == 0x2d:
+        return (-1, index + 1)
+    (1, index)
+
+fn parse_int(source: List[u8], index: usize, size: usize, minimum: i64, maximum: i64, format: u8) -> Result[(i64, usize), string]:
+    let value = 0i64
+    let i = index
+    l := if index + size < source.len(): index + size else: source.len()
+    while i < l:
+        b := source[i]
+        if b >= 0x30 && b <= 0x39:
+            value = value * 10 + i64(b - 0x30)
+        else:
+            break
+        i += 1
+    if i == index || value < minimum || maximum < value:
+        return .Err(parse_format_error(format))
+    .Ok((value, i))
+
+fn parse_int64(source: List[u8], index: usize, maximum: i64, format: u8) -> Result[(i64, usize), string]:
+    let value = 0i64
+    let i = index
+    while i < source.len():
+        b := source[i]
+        if b >= 0x30 && b <= 0x39:
+            value = value * 10 + i64(b - 0x30)
+            if value > maximum:
+                return .Err(parse_format_error(format))
+        else:
+            break
+        i += 1
+    if i == index:
+        return .Err(parse_format_error(format))
+    .Ok((value, i))
+
+fn parse_any(source: List[u8], index: usize, candidates: List[string], format: u8) -> Result[(i64, usize), string]:
+    for (i, x) in candidates.iter().enumerate():
+        xs := bytes_of(x)
+        let j = index
+        let ok = true
+        for k in 0..xs.len():
+            if j >= source.len():
+                ok = false
+                break
+            a := xs[k]
+            c := source[j]
+            if a != c && (a | 0x20) != (c | 0x20):
+                ok = false
+                break
+            j += 1
+        if ok:
+            return .Ok((i64(i) + 1, j))
+    .Err(parse_format_error(format))
+
+fn location_zone(loc: *mut Location) -> (string, i64):
+    date(2000, 1, 1, 0, 0, 0, 0, loc).zone()
+
+fn parse_time(source: List[u8], format: List[u8], loc0: *mut Location, base: *mut Location) -> Result[Time, string]:
+    let loc = loc0
+    let year = 1900i64
+    let month = 1i64
+    let day = 0i64
+    let hour = 0i64
+    let minute = 0i64
+    let second = 0i64
+    let nanosecond = 0i64
+    let j = 0usize
+    let week = 0i64
+    let weekday = 0i64
+    let yday = 0i64
+    let ampm = 0i64
+    let colons = 0i64
+    let sign = 0i64
+    let century = -1i64
+    let weekstart = -1i64
+    let has_iso_year = false
+    let has_unix = false
+    let has_zone_name = false
+    let has_zone_offset = false
+    let mut pending: List[u8] = []
+    l := source.len()
+    n := format.len()
+    let i = 0usize
+    while i < n:
+        let b = format[i]
+        if b != 0x25:
+            if j >= l || source[j] != b:
+                return .Err(expected_format_error(rune_at(format, i)))
+            j += 1
+            i += 1
+            continue
+        i += 1
+        if i == n:
+            return .Err("stray \"%\"")
+        b = format[i]
+        let dispatch = true
+        while dispatch:
+            dispatch = false
+            let redo = false
+            match b:
+                0x47 =>
+                    has_iso_year = true
+                    let (s, j1) = parse_sign(source, j, l)
+                    let (y, j2) = parse_int(source, j1, 4, 0, 9999, b)?
+                    sign = s
+                    year = y * s
+                    j = j2
+                0x59 =>
+                    let (s, j1) = parse_sign(source, j, l)
+                    let (y, j2) = parse_int(source, j1, 4, 0, 9999, b)?
+                    sign = s
+                    year = y * s
+                    j = j2
+                0x67 =>
+                    has_iso_year = true
+                    let (y, j1) = parse_int(source, j, 2, 0, 99, b)?
+                    year = if y < 69: y + 2000 else: y + 1900
+                    j = j1
+                0x79 =>
+                    let (y, j1) = parse_int(source, j, 2, 0, 99, b)?
+                    year = if y < 69: y + 2000 else: y + 1900
+                    j = j1
+                0x43 =>
+                    let (s, j1) = parse_sign(source, j, l)
+                    sign = s
+                    if s < 0:
+                        return .Err("negative century is not supported for \"%C\"")
+                    let (c, j2) = parse_int(source, j1, 2, 0, 99, 0x43)?
+                    century = c
+                    j = j2
+                0x6d =>
+                    let (m, j1) = parse_int(source, j, 2, 1, 12, 0x6d)?
+                    month = m
+                    j = j1
+                0x42 =>
+                    let (m, j1) = parse_any(source, j, long_month_names(), 0x42)?
+                    month = m
+                    j = j1
+                0x62 =>
+                    let (m, j1) = parse_any(source, j, short_month_names(), b)?
+                    month = m
+                    j = j1
+                0x68 =>
+                    let (m, j1) = parse_any(source, j, short_month_names(), b)?
+                    month = m
+                    j = j1
+                0x41 =>
+                    let (w, j1) = parse_any(source, j, long_week_names(), 0x41)?
+                    weekday = w
+                    j = j1
+                0x61 =>
+                    let (w, j1) = parse_any(source, j, short_week_names(), 0x61)?
+                    weekday = w
+                    j = j1
+                0x77 =>
+                    let (w, j1) = parse_int(source, j, 1, 0, 6, 0x77)?
+                    weekday = w + 1
+                    j = j1
+                0x75 =>
+                    let (w, j1) = parse_int(source, j, 1, 1, 7, 0x75)?
+                    weekday = w % 7 + 1
+                    j = j1
+                0x56 =>
+                    let (w, j1) = parse_int(source, j, 2, 1, 53, b)?
+                    week = w
+                    j = j1
+                    weekstart = 4
+                    weekday = or(weekday, 2)
+                0x55 =>
+                    let (w, j1) = parse_int(source, j, 2, 0, 53, b)?
+                    week = w
+                    j = j1
+                    weekstart = 0
+                    weekday = or(weekday, 1)
+                0x57 =>
+                    let (w, j1) = parse_int(source, j, 2, 0, 53, b)?
+                    week = w
+                    j = j1
+                    weekstart = 1
+                    weekday = or(weekday, 2)
+                0x65 =>
+                    if j < l && source[j] == 0x20:
+                        j += 1
+                    let (d, j1) = parse_int(source, j, 2, 1, 31, b)?
+                    day = d
+                    j = j1
+                0x64 =>
+                    let (d, j1) = parse_int(source, j, 2, 1, 31, b)?
+                    day = d
+                    j = j1
+                0x6a =>
+                    let (d, j1) = parse_int(source, j, 3, 1, 366, 0x6a)?
+                    yday = d
+                    j = j1
+                0x6b =>
+                    if j < l && source[j] == 0x20:
+                        j += 1
+                    let (h, j1) = parse_int(source, j, 2, 0, 23, b)?
+                    hour = h
+                    j = j1
+                0x48 =>
+                    let (h, j1) = parse_int(source, j, 2, 0, 23, b)?
+                    hour = h
+                    j = j1
+                0x6c =>
+                    if j < l && source[j] == 0x20:
+                        j += 1
+                    let (h, j1) = parse_int(source, j, 2, 1, 12, b)?
+                    hour = if h == 12: 0 else: h
+                    j = j1
+                0x49 =>
+                    let (h, j1) = parse_int(source, j, 2, 1, 12, b)?
+                    hour = if h == 12: 0 else: h
+                    j = j1
+                0x50 =>
+                    let (a, j1) = parse_any(source, j, ["AM", "PM"], b)?
+                    ampm = a
+                    j = j1
+                0x70 =>
+                    let (a, j1) = parse_any(source, j, ["AM", "PM"], b)?
+                    ampm = a
+                    j = j1
+                0x4d =>
+                    let (m, j1) = parse_int(source, j, 2, 0, 59, 0x4d)?
+                    minute = m
+                    j = j1
+                0x53 =>
+                    let (s, j1) = parse_int(source, j, 2, 0, 60, 0x53)?
+                    second = s
+                    j = j1
+                0x73 =>
+                    let (s, j1) = parse_sign(source, j, l)
+                    sign = s
+                    let max_unix = 67767976233532799i64
+                    if s < 0:
+                        max_unix = 67768100567971200
+                    let (u, j2) = parse_int64(source, j1, max_unix, 0x73)?
+                    j = j2
+                    t := unix(sign * u, 0).in_loc(utc())
+                    let (y, mo, d) = t.date()
+                    let (h, mi, se) = t.clock()
+                    year = y
+                    month = mo
+                    day = d
+                    hour = h
+                    minute = mi
+                    second = se
+                    has_unix = true
+                0x66 =>
+                    i0 := j
+                    let (us0, j1) = parse_int(source, j, 6, 0, 999999, 0x66)?
+                    j = j1
+                    let us = us0
+                    let k = j - i0
+                    while k < 6:
+                        us *= 10
+                        k += 1
+                    nanosecond = us * 1000
+                0x5a =>
+                    if j >= l:
+                        return .Err(parse_format_error(0x5a))
+                    i0 := j
+                    if source[j] == 0x2b || source[j] == 0x2d:
+                        j += 1
+                        while j < l:
+                            if source[j] < 0x30 || source[j] > 0x39:
+                                break
+                            j += 1
+                    else if j + 4 <= l && (to_string(source.slice(j, j + 4)) == "ChST" || to_string(source.slice(j, j + 4)) == "MeST"):
+                        j += 4
+                    else:
+                        while j < l:
+                            if source[j] < 0x41 || source[j] > 0x5a:
+                                break
+                            j += 1
+                    name := to_string(source.slice(i0, j))
+                    let .Some(zl) = parse_zone_name(name, base) else:
+                        return .Err(parse_format_error(0x5a))
+                    if has_zone_offset:
+                        let (_, offset) = location_zone(loc)
+                        loc = fixed_zone(name, offset)
+                    else:
+                        loc = zl
+                    has_zone_name = true
+                0x7a =>
+                    if j >= l:
+                        return .Err(parse_z_format_error(colons))
+                    sign = 1
+                    c0 := source[j]
+                    if c0 == 0x2d || c0 == 0x2b:
+                        if c0 == 0x2d:
+                            sign = -1
+                        let zh = 0i64
+                        let zm = 0i64
+                        let zs = 0i64
+                        let ii = j + 1
+                        let (h, jh) = parse_int(source, ii, 2, 0, 23, 0x7a).unwrap_or((0, 0))
+                        if jh != ii + 2:
+                            return .Err(parse_z_format_error(colons))
+                        zh = h
+                        j = jh
+                        if j >= l || source[j] != 0x3a:
+                            if colons > 0 && colons < 3:
+                                return .Err(expected_colon_error(colons))
+                        else:
+                            j += 1
+                            if colons == 0:
+                                colons = 4
+                        ii = j
+                        let (m, jm) = parse_int(source, ii, 2, 0, 59, 0x7a).unwrap_or((0, 0))
+                        if jm != ii + 2:
+                            if colons > 0 && colons != 3:
+                                return .Err(parse_z_format_error(colons & 3))
+                            j = ii
+                        else:
+                            zm = m
+                            j = jm
+                            if colons > 1:
+                                if j >= l || source[j] != 0x3a:
+                                    if colons < 3:
+                                        return .Err(expected_colon_error(colons))
+                                else:
+                                    ii = j + 1
+                                    let (s, js) = parse_int(source, ii, 2, 0, 59, 0x7a).unwrap_or((0, 0))
+                                    if js != ii + 2:
+                                        if colons < 3:
+                                            return .Err(parse_z_format_error(colons))
+                                        j = ii - 1
+                                    else:
+                                        zs = s
+                                        j = js
+                        let zname = if has_zone_name: location_zone(loc)._0 else: ""
+                        loc = fixed_zone(zname, sign * ((zh * 60 + zm) * 60 + zs))
+                        colons = 0
+                        has_zone_offset = true
+                    else if c0 == 0x5a:
+                        loc = utc()
+                        colons = 0
+                        j += 1
+                    else:
+                        return .Err(parse_z_format_error(colons))
+                0x3a =>
+                    if !pending.is_empty():
+                        if j >= l || source[j] != b:
+                            return .Err(expected_format_error(':'))
+                        j += 1
+                    else:
+                        colons = 1
+                        let to_z = false
+                        while colons <= 3:
+                            i += 1
+                            if i == n:
+                                break
+                            b = format[i]
+                            if b == 0x7a:
+                                to_z = true
+                                break
+                            if b != 0x3a || colons == 3:
+                                break
+                            colons += 1
+                        if !to_z:
+                            return .Err(expected_z_after_colon_error(colons))
+                        redo = true
+                0x74 =>
+                    i0 := j
+                    while j < l && (source[j] == 0x20 || (source[j] >= 0x09 && source[j] <= 0x0d)):
+                        j += 1
+                    if i0 == j:
+                        return .Err("expected a space for \"%${to_string([b])}\"")
+                0x6e =>
+                    i0 := j
+                    while j < l && (source[j] == 0x20 || (source[j] >= 0x09 && source[j] <= 0x0d)):
+                        j += 1
+                    if i0 == j:
+                        return .Err("expected a space for \"%${to_string([b])}\"")
+                0x25 =>
+                    if j >= l || source[j] != b:
+                        return .Err(expected_format_error('%'))
+                    j += 1
+                0x63 => pending = bytes_of("a b e H:M:S Y")
+                0x2b => pending = bytes_of("a b e H:M:S Z Y")
+                0x76 => pending = bytes_of("e-b-Y")
+                0x72 => pending = bytes_of("I:M:S p")
+                0x46 => pending = bytes_of("Y-m-d")
+                0x44 => pending = bytes_of("m/d/y")
+                0x78 => pending = bytes_of("m/d/y")
+                0x54 => pending = bytes_of("H:M:S")
+                0x58 => pending = bytes_of("H:M:S")
+                0x52 => pending = bytes_of("H:M")
+                _ =>
+                    if pending.is_empty():
+                        return .Err("unexpected format \"%${rune_at(format, i)}\"")
+                    if j >= l || source[j] != b:
+                        return .Err(expected_format_error(rune_at([b], 0)))
+                    j += 1
+            if redo:
+                dispatch = true
+            else if !pending.is_empty():
+                b = pending[0]
+                pending = pending.slice(1, pending.len())
+                dispatch = true
+        i += 1
+    if j < l:
+        return .Err("unparsed string ${quote(to_string(source.slice(j, l)))}")
+    if ampm > 0:
+        hour = hour % 12 + (ampm - 1) * 12
+    if century >= 0:
+        year = century * 100 + year % 100
+    if day <= 0 && yday <= 0 && !has_iso_year && weekstart < 0:
+        day = 1
+    if day > 0:
+        if has_iso_year:
+            return .Err("use \"%Y\" to parse non-ISO year")
+        if has_unix:
+            return .Ok(date(year, month, day, hour, minute, second, nanosecond, utc()).in_loc(loc))
+        return .Ok(date(year, month, day, hour, minute, second, nanosecond, loc))
+    if yday > 0:
+        if has_iso_year:
+            return .Err("use \"%Y\" to parse non-ISO year for \"%j\"")
+        return .Ok(date(year, 1, yday, hour, minute, second, nanosecond, loc))
+    if has_iso_year && weekstart < 0:
+        weekstart = 4
+        week = 1
+        weekday = or(weekday, 2)
+    if (weekstart == 4) != has_iso_year:
+        if has_iso_year:
+            return .Err("use \"%Y\" to parse non-ISO year for \"%U\" or \"%W\"")
+        return .Err("use \"%G\" to parse ISO year for \"%V\"")
+    if weekstart > 0 && weekday == 1:
+        week += 1
+    t := date(year, 1, -weekstart, 0, 0, 0, 0, utc())
+    .Ok(date(year, 1, week * 7 - weekstart - t.weekday() + weekday - 1, hour, minute, second, nanosecond, loc))

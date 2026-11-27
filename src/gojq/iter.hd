@@ -1,0 +1,53 @@
+## Port of gojq/iter.go, and the values the VM keeps on its stack.
+use pkg.goshim.value.{Value, Allocator}
+use std.console.ConsoleInput
+use std.fs.FsRead
+use pkg.gojq.error.JqError
+
+## Go's `any` on the VM stack and in variables.
+pub enum Item:
+    V(v: Value)
+    Err(e: JqError)
+    It(it: *mut dyn Iter)
+    ## a closure reference: [2]int{pc, scope index}
+    Pc(pc: i64, scope: i64)
+    ## the rest of an iteration: []pathValue, as the list and where the rest
+    ## starts (Go re-slices without copying)
+    Paths(xs: List[PathValue], start: usize)
+    Alloc(a: *mut Allocator)
+    ## emptyIter{}
+    Empty
+
+pub struct PathValue:
+    ## `.None` is the nil path that marks the start of a path() expression
+    pub path: Value?
+    pub value: Item
+
+## Iter is an interface for an iterator.
+pub trait Iter:
+    fn next(&mut self) -> Item?
+
+## The iterator given with WithInputIter; reading input waits.
+pub trait InputIter:
+    fn next!(&mut self) -> Item? $ ConsoleInput + FsRead
+
+struct SliceIter:
+    values: List[Item]
+    pos: usize
+
+impl Iter for SliceIter:
+    fn next(&mut self) -> Item?:
+        if self.pos >= self.values.len():
+            return .None
+        v := self.values[self.pos]
+        self.pos += 1
+        .Some(v)
+
+## NewIter creates a new Iter from values.
+pub fn new_iter(values: List[Item]) -> *mut dyn Iter:
+    box(SliceIter { values: values, pos: 0 })
+
+pub fn item_value(it: Item) -> Value:
+    match it:
+        .V(v) => v
+        _ => panic("expected a value on the stack")

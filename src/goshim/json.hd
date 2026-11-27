@@ -1,0 +1,480 @@
+## The parts of Go's encoding/json that gojq uses: a stream Decoder with
+## UseNumber (Decode, Token, InputOffset) and string unquoting, with Go's
+## error messages (SyntaxError offsets count the bytes read).
+use std.convert.TryFrom
+use std.text.StringBuilder
+use pkg.goshim.value.{Value, arr, obj}
+use pkg.goshim.strconv.{quote_rune, parse_float}
+use pkg.goshim.encoding.{go_bytes, lossy, lossy_fffd}
+
+pub enum JsonErr:
+    ## *json.SyntaxError
+    Syntax(msg: string, offset: i64)
+    ## io.ErrUnexpectedEOF
+    UnexpectedEOF
+
+pub enum Token:
+    Delim(c: char)
+    Val(v: Value)
+
+# Decoder.Token states (encoding/json/stream.go).
+TOKEN_TOP_VALUE := 0i64
+TOKEN_ARRAY_START := 1i64
+TOKEN_ARRAY_VALUE := 2i64
+TOKEN_ARRAY_COMMA := 3i64
+TOKEN_OBJECT_START := 4i64
+TOKEN_OBJECT_KEY := 5i64
+TOKEN_OBJECT_COLON := 6i64
+TOKEN_OBJECT_VALUE := 7i64
+TOKEN_OBJECT_COMMA := 8i64
+
+pub struct Decoder:
+    bytes: List[u8]
+    pos: usize
+    use_number: bool = true
+    token_state: i64 = 0
+    token_stack: List[i64] = []
+    ## Go's read buffer: its start (dec.scanned), length and capacity. It
+    ## decides how much input Go has read when it reports an error.
+    scanned: i64 = 0
+    blen: i64 = 0
+    bcap: i64 = 0
+
+## json.NewDecoder over the bytes of a Go string.
+pub fn new_decoder(text: string) -> *mut Decoder:
+    new_decoder_bytes(go_bytes(text))
+
+## json.NewDecoder over raw input bytes.
+pub fn new_decoder_bytes(bytes: List[u8]) -> *mut Decoder:
+    box(Decoder { bytes: bytes, pos: 0 })
+
+fn hex_digit(b: u8) -> u32?:
+    if b >= 48 && b <= 57:
+        return .Some(u32(b - 48))
+    if b >= 97 && b <= 102:
+        return .Some(u32(b - 87))
+    if b >= 65 && b <= 70:
+        return .Some(u32(b - 55))
+    .None
+
+impl Decoder:
+    pub fn input_offset(&self) -> i64:
+        i64(self.pos)
+
+    ## The end of the input Go's Decoder has read so far.
+    pub fn read_end(&self) -> i64:
+        self.scanned + self.blen
+
+    ## Decoder.refill, with the reader giving all it is asked for.
+    fn refill(&mut self, scanp: i64) -> void:
+        if scanp > self.scanned:
+            self.blen -= scanp - self.scanned
+            self.scanned = scanp
+        if self.bcap - self.blen < 512:
+            self.bcap = 2 * self.bcap + 512
+        rest := i64(self.bytes.len()) - (self.scanned + self.blen)
+        self.blen += if self.bcap - self.blen < rest: self.bcap - self.blen else: rest
+
+    ## Reads until byte q is in the buffer (or the input ends).
+    fn ensure(&mut self, q: i64, scanp: i64) -> void:
+        while self.scanned + self.blen <= q && self.scanned + self.blen < i64(self.bytes.len()):
+            self.refill(scanp)
+
+    fn ensure_err(&mut self, e: JsonErr, scanp: i64) -> void:
+        match e:
+            .Syntax(_, off) => self.ensure(off - 1, scanp)
+            .UnexpectedEOF => self.ensure(i64(self.bytes.len()), scanp)
+
+    fn quote_at(&self, at: usize) -> string:
+        b := self.bytes[at]
+        if b < 128:
+            return quote_rune(char::try_from(u32(b)).unwrap_or('?'))
+        let end = at + 1
+        while end < self.bytes.len() && end < at + 4 && self.bytes[end] >= 128 && self.bytes[end] < 192:
+            end += 1
+        match string::from_utf8(self.bytes.slice(at, end)):
+            .Ok(t) =>
+                let cs: List[char] = t.chars().collect()
+                quote_rune(cs[0])
+            .Err(_) =>
+                # strconv.Quote of the single invalid byte
+                hex := "0123456789abcdef"
+                "'\\x" + hex.slice(usize(b >> 4), usize(b >> 4) + 1) + hex.slice(usize(b & 15), usize(b & 15) + 1) + "'"
+
+    fn syntax(&self, context: string) -> JsonErr:
+        if self.pos >= self.bytes.len():
+            return .UnexpectedEOF
+        .Syntax("invalid character ${self.quote_at(self.pos)} $context", i64(self.pos) + 1)
+
+    fn skip_ws(&mut self) -> void:
+        while self.pos < self.bytes.len():
+            b := self.bytes[self.pos]
+            if b == 32 || b == 9 || b == 10 || b == 13:
+                self.pos += 1
+            else:
+                break
+
+    ## Decode reads the next value; `.None` is io.EOF.
+    pub fn decode(&mut self) -> Result[Value?, JsonErr]:
+        start := i64(self.pos)
+        self.skip_ws()
+        if self.pos >= self.bytes.len():
+            self.ensure(i64(self.bytes.len()), start)
+            return .Ok(.None)
+        match self.value():
+            .Ok(v) =>
+                # the end of a scalar shows only at the byte after it
+                end := match v:
+                    .Arr(_) => i64(self.pos) - 1
+                    .Obj(_) => i64(self.pos) - 1
+                    _ => i64(self.pos)
+                self.ensure(end, start)
+                .Ok(.Some(v))
+            .Err(e) =>
+                self.ensure_err(e, start)
+                .Err(e)
+
+    ## Whether only whitespace remains (Decoder.Token returning io.EOF).
+    pub fn at_eof(&mut self) -> bool:
+        self.skip_ws()
+        self.pos >= self.bytes.len()
+
+    ## The first non-space byte after a complete value, for gojq's trailing checks.
+    pub fn rest(&mut self) -> string:
+        self.skip_ws()
+        lossy(self.bytes.slice(self.pos, self.bytes.len()))
+
+    fn literal(&mut self, word: string, v: Value) -> Result[Value, JsonErr]:
+        let wb: List[u8] = word.bytes().collect()
+        for i in 0..wb.len():
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.bytes[self.pos] != wb[i]:
+                if i == 0:
+                    return .Err(self.syntax("looking for beginning of value"))
+                expect := quote_rune(char::try_from(u32(wb[i])).unwrap_or('?'))
+                return .Err(self.syntax("in literal $word (expecting $expect)"))
+            self.pos += 1
+        .Ok(v)
+
+    fn value(&mut self) -> Result[Value, JsonErr]:
+        self.skip_ws()
+        if self.pos >= self.bytes.len():
+            return .Err(.UnexpectedEOF)
+        b := self.bytes[self.pos]
+        if b == 123:
+            return self.object()
+        if b == 91:
+            return self.array()
+        if b == 34:
+            return .Ok(.Str(self.string()?))
+        if b == 116:
+            return self.literal("true", .Bool(true))
+        if b == 102:
+            return self.literal("false", .Bool(false))
+        if b == 110:
+            return self.literal("null", .Null)
+        if b == 45 || (b >= 48 && b <= 57):
+            return self.number()
+        .Err(self.syntax("looking for beginning of value"))
+
+    fn digits(&mut self) -> usize:
+        start := self.pos
+        while self.pos < self.bytes.len() && self.bytes[self.pos] >= 48 && self.bytes[self.pos] <= 57:
+            self.pos += 1
+        self.pos - start
+
+    fn number(&mut self) -> Result[Value, JsonErr]:
+        start := self.pos
+        if self.bytes[self.pos] == 45:
+            self.pos += 1
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.bytes[self.pos] < 48 || self.bytes[self.pos] > 57:
+                return .Err(self.syntax("in numeric literal"))
+        if self.bytes[self.pos] == 48:
+            self.pos += 1
+        else:
+            _ := self.digits()
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == 46:
+            self.pos += 1
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.digits() == 0:
+                return .Err(self.syntax("after decimal point in numeric literal"))
+        if self.pos < self.bytes.len() && (self.bytes[self.pos] == 101 || self.bytes[self.pos] == 69):
+            self.pos += 1
+            if self.pos < self.bytes.len() && (self.bytes[self.pos] == 43 || self.bytes[self.pos] == 45):
+                self.pos += 1
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.digits() == 0:
+                return .Err(self.syntax("in exponent of numeric literal"))
+        text := lossy_fffd(self.bytes.slice(start, self.pos))
+        if self.use_number:
+            return .Ok(.Number(text))
+        .Ok(.Float(parse_float(text).unwrap_or(0.0)))
+
+    fn hex4(&mut self) -> Result[u32, JsonErr]:
+        let code: u32 = 0
+        for _ in 0..4:
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            match hex_digit(self.bytes[self.pos]):
+                .Some(d) => code = code * 16 + d
+                .None => return .Err(self.syntax("in \\u hexadecimal character escape"))
+            self.pos += 1
+        .Ok(code)
+
+    fn string(&mut self) -> Result[string, JsonErr]:
+        self.pos += 1
+        out := StringBuilder::new()
+        let start = self.pos
+        while true:
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            b := self.bytes[self.pos]
+            if b == 34:
+                out.push(lossy_fffd(self.bytes.slice(start, self.pos)))
+                self.pos += 1
+                break
+            if b < 32:
+                return .Err(self.syntax("in string literal"))
+            if b == 92:
+                out.push(lossy_fffd(self.bytes.slice(start, self.pos)))
+                self.pos += 1
+                if self.pos >= self.bytes.len():
+                    return .Err(.UnexpectedEOF)
+                e := self.bytes[self.pos]
+                self.pos += 1
+                if e == 34:
+                    out.push("\"")
+                else if e == 92:
+                    out.push("\\")
+                else if e == 47:
+                    out.push("/")
+                else if e == 98:
+                    out.push("\u{8}")
+                else if e == 102:
+                    out.push("\u{c}")
+                else if e == 110:
+                    out.push("\n")
+                else if e == 114:
+                    out.push("\r")
+                else if e == 116:
+                    out.push("\t")
+                else if e == 117:
+                    let code = self.hex4()?
+                    if code >= 0xD800 && code < 0xDC00:
+                        if self.pos + 1 < self.bytes.len() && self.bytes[self.pos] == 92 && self.bytes[self.pos + 1] == 117:
+                            save := self.pos
+                            self.pos += 2
+                            low := self.hex4()?
+                            if low >= 0xDC00 && low < 0xE000:
+                                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                            else:
+                                self.pos = save
+                                code = 0xFFFD
+                        else:
+                            code = 0xFFFD
+                    else if code >= 0xDC00 && code < 0xE000:
+                        code = 0xFFFD
+                    out.push_char(char::try_from(code).unwrap_or('\u{FFFD}'))
+                else:
+                    self.pos -= 1
+                    return .Err(self.syntax("in string escape code"))
+                start = self.pos
+                continue
+            self.pos += 1
+        .Ok(out.build())
+
+    fn array(&mut self) -> Result[Value, JsonErr]:
+        self.pos += 1
+        let mut items: List[Value] = []
+        self.skip_ws()
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == 93:
+            self.pos += 1
+            return .Ok(arr(items))
+        while true:
+            items.push(self.value()?)
+            self.skip_ws()
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            b := self.bytes[self.pos]
+            if b == 44:
+                self.pos += 1
+                continue
+            if b == 93:
+                self.pos += 1
+                break
+            return .Err(self.syntax("after array element"))
+        .Ok(arr(items))
+
+    fn object(&mut self) -> Result[Value, JsonErr]:
+        self.pos += 1
+        let mut fields: Map[string, Value] = {}
+        self.skip_ws()
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == 125:
+            self.pos += 1
+            return .Ok(obj(fields))
+        while true:
+            self.skip_ws()
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.bytes[self.pos] != 34:
+                return .Err(self.syntax("looking for beginning of object key string"))
+            key := self.string()?
+            self.skip_ws()
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.bytes[self.pos] != 58:
+                return .Err(self.syntax("after object key"))
+            self.pos += 1
+            fields[key] = self.value()?
+            self.skip_ws()
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            b := self.bytes[self.pos]
+            if b == 44:
+                self.pos += 1
+                continue
+            if b == 125:
+                self.pos += 1
+                break
+            return .Err(self.syntax("after object key:value pair"))
+        .Ok(obj(fields))
+
+    # ------------------------------------------------------------ Token
+
+    fn token_prepare_for_decode(&mut self) -> Result[void, JsonErr]:
+        self.skip_ws()
+        if self.token_state == TOKEN_ARRAY_COMMA:
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.bytes[self.pos] != 44:
+                return .Err(self.syntax("after array element"))
+            self.pos += 1
+            self.token_state = TOKEN_ARRAY_VALUE
+        else if self.token_state == TOKEN_OBJECT_COLON:
+            if self.pos >= self.bytes.len():
+                return .Err(.UnexpectedEOF)
+            if self.bytes[self.pos] != 58:
+                return .Err(self.syntax("after object key"))
+            self.pos += 1
+            self.token_state = TOKEN_OBJECT_VALUE
+        .Ok(())
+
+    fn token_value_allowed(&self) -> bool:
+        s := self.token_state
+        s == TOKEN_TOP_VALUE || s == TOKEN_ARRAY_START || s == TOKEN_ARRAY_VALUE || s == TOKEN_OBJECT_VALUE
+
+    fn token_value_end(&mut self) -> void:
+        s := self.token_state
+        if s == TOKEN_ARRAY_START || s == TOKEN_ARRAY_VALUE:
+            self.token_state = TOKEN_ARRAY_COMMA
+        else if s == TOKEN_OBJECT_VALUE:
+            self.token_state = TOKEN_OBJECT_COMMA
+
+    ## Decoder.Token: the next JSON token; `.None` is io.EOF.
+    pub fn token(&mut self) -> Result[Token?, JsonErr]:
+        start := i64(self.pos)
+        r := self.token_inner()
+        match r:
+            .Err(e) => self.ensure_err(e, start)
+            .Ok(_) => self.ensure(i64(self.pos), start)
+        r
+
+    fn token_inner(&mut self) -> Result[Token?, JsonErr]:
+        while true:
+            self.skip_ws()
+            if self.pos >= self.bytes.len():
+                if self.token_state != TOKEN_TOP_VALUE:
+                    return .Err(.UnexpectedEOF)
+                return .Ok(.None)
+            c := self.bytes[self.pos]
+            if c == 91:
+                if !self.token_value_allowed():
+                    return .Err(self.token_error())
+                self.pos += 1
+                self.token_stack.push(self.token_state)
+                self.token_state = TOKEN_ARRAY_START
+                return .Ok(.Some(.Delim('[')))
+            if c == 93:
+                if self.token_state != TOKEN_ARRAY_START && self.token_state != TOKEN_ARRAY_COMMA:
+                    return .Err(self.token_error())
+                self.pos += 1
+                self.token_state = self.token_stack.pop().unwrap_or(0)
+                self.token_value_end()
+                return .Ok(.Some(.Delim(']')))
+            if c == 123:
+                if !self.token_value_allowed():
+                    return .Err(self.token_error())
+                self.pos += 1
+                self.token_stack.push(self.token_state)
+                self.token_state = TOKEN_OBJECT_START
+                return .Ok(.Some(.Delim('{')))
+            if c == 125:
+                if self.token_state != TOKEN_OBJECT_START && self.token_state != TOKEN_OBJECT_COMMA:
+                    return .Err(self.token_error())
+                self.pos += 1
+                self.token_state = self.token_stack.pop().unwrap_or(0)
+                self.token_value_end()
+                return .Ok(.Some(.Delim('}')))
+            if c == 58:
+                if self.token_state != TOKEN_OBJECT_COLON:
+                    return .Err(self.token_error())
+                self.pos += 1
+                self.token_state = TOKEN_OBJECT_VALUE
+                continue
+            if c == 44:
+                if self.token_state == TOKEN_ARRAY_COMMA:
+                    self.pos += 1
+                    self.token_state = TOKEN_ARRAY_VALUE
+                    continue
+                if self.token_state == TOKEN_OBJECT_COMMA:
+                    self.pos += 1
+                    self.token_state = TOKEN_OBJECT_KEY
+                    continue
+                return .Err(self.token_error())
+            if c == 34 && (self.token_state == TOKEN_OBJECT_START || self.token_state == TOKEN_OBJECT_KEY):
+                key := self.string()?
+                self.token_state = TOKEN_OBJECT_COLON
+                return .Ok(.Some(.Val(.Str(key))))
+            if !self.token_value_allowed():
+                return .Err(self.token_error())
+            v := self.value()?
+            self.token_value_end()
+            return .Ok(.Some(.Val(v)))
+        .Ok(.None)
+
+    fn token_error(&self) -> JsonErr:
+        let context = ""
+        s := self.token_state
+        if s == TOKEN_TOP_VALUE:
+            context = " looking for beginning of value"
+        else if s == TOKEN_ARRAY_START || s == TOKEN_ARRAY_VALUE || s == TOKEN_OBJECT_VALUE:
+            context = " looking for beginning of value"
+        else if s == TOKEN_ARRAY_COMMA:
+            context = " after array element"
+        else if s == TOKEN_OBJECT_KEY:
+            context = " looking for beginning of object key string"
+        else if s == TOKEN_OBJECT_COLON:
+            context = " after object key"
+        else if s == TOKEN_OBJECT_COMMA:
+            context = " after object key:value pair"
+        .Syntax("invalid character ${self.quote_at(self.pos)}$context", i64(self.pos) + 1)
+
+## json.Unmarshal of a quoted JSON string literal (used by the lexer).
+pub fn unquote(src: string) -> Result[string, JsonErr]:
+    let mut d = Decoder { bytes: go_bytes(src), pos: 0 }
+    if d.bytes.is_empty() || d.bytes[0] != 34:
+        return .Err(d.syntax("looking for beginning of value"))
+    s := d.string()?
+    if !d.at_eof():
+        return .Err(.Syntax("invalid character ${d.quote_at(d.pos)} after top-level value", i64(d.pos) + 1))
+    .Ok(s)
+
+pub fn error_string(e: JsonErr) -> string:
+    match e:
+        .Syntax(msg, _) => msg
+        .UnexpectedEOF => "unexpected EOF"

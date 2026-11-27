@@ -1,0 +1,154 @@
+## Port of gojq/encoder.go: the jq-flavored JSON encoding of values.
+use std.text.StringBuilder
+use pkg.goshim.value.{Value, ArrBox, ObjBox}
+use pkg.goshim.bigint
+use pkg.goshim.strconv.format_float
+
+MAX_FLOAT := 1.7976931348623157e308
+
+## Marshal returns the jq-flavored JSON encoding of v.
+pub fn marshal(v: Value) -> string:
+    json_marshal(v)
+
+pub fn json_marshal(v: Value) -> string:
+    sb := StringBuilder::new()
+    encode(sb, v, 0)
+    sb.build()
+
+pub fn json_encode_string(sb: *mut StringBuilder, v: string) -> void:
+    encode_string(sb, v, 0)
+
+## `limit` > 0 stops encoding once about that many bytes are written (for Preview).
+fn encode(sb: *mut StringBuilder, v: Value, limit: usize) -> void:
+    match v:
+        .Null => sb.push("null")
+        .Bool(b) => sb.push(if b: "true" else: "false")
+        .Int(i) => sb.push("$i")
+        .Float(f) => encode_float64(sb, f)
+        .Big(b) => sb.push(bigint.to_string(b))
+        .Number(s) => sb.push(s)
+        .Str(s) => encode_string(sb, s, limit)
+        .Arr(a) => encode_array(sb, a, limit)
+        .Obj(m) => encode_object(sb, m, limit)
+        .Hole => sb.push("{}")
+
+## ref: floatEncoder in encoding/json
+pub fn encode_float64(sb: *mut StringBuilder, f0: f64) -> void:
+    if f0.is_nan():
+        sb.push("null")
+        return
+    let f = f0
+    if f > MAX_FLOAT:
+        f = MAX_FLOAT
+    if f < -MAX_FLOAT:
+        f = -MAX_FLOAT
+    x := f.abs()
+    let fmt = 'f'
+    if x != 0.0 && x < 1e-6 || x >= 1e21:
+        fmt = 'e'
+    let buf = format_float(f, fmt)
+    if fmt == 'e':
+        # clean up e-09 to e-9
+        n := buf.len()
+        if n >= 4 && buf.slice(n - 4, n - 2) == "e-" && buf.slice(n - 2, n - 1) == "0":
+            buf = buf.slice(0, n - 2) + buf.slice(n - 1, n)
+    sb.push(buf)
+
+HEX := "0123456789abcdef"
+
+## ref: encodeState#string in encoding/json
+fn encode_string(sb: *mut StringBuilder, s: string, limit: usize) -> void:
+    sb.push("\"")
+    let bytes: List[u8] = s.bytes().collect()
+    let start = 0
+    let i = 0
+    while i < bytes.len():
+        b := bytes[i]
+        if b < 128:
+            if b >= 32 && b <= 126 && b != 34 && b != 92:
+                i += 1
+                continue
+            if start < i:
+                sb.push(s.slice(start, i))
+            if b == 34:
+                sb.push("\\\"")
+            else if b == 92:
+                sb.push("\\\\")
+            else if b == 8:
+                sb.push("\\b")
+            else if b == 12:
+                sb.push("\\f")
+            else if b == 10:
+                sb.push("\\n")
+            else if b == 13:
+                sb.push("\\r")
+            else if b == 9:
+                sb.push("\\t")
+            else:
+                sb.push("\\u00")
+                sb.push(HEX.slice(usize(b >> 4), usize(b >> 4) + 1))
+                sb.push(HEX.slice(usize(b & 15), usize(b & 15) + 1))
+            i += 1
+            start = i
+            continue
+        if b == 0xF4 && is_marker_at(bytes, i):
+            # an invalid byte of the Go string (see goshim/encoding.hd)
+            if start < i:
+                sb.push(s.slice(start, i))
+            sb.push("\\ufffd")
+            i += 4
+            start = i
+            continue
+        i += 1
+        if limit > 0 && i - start > limit:
+            break
+    if start < bytes.len():
+        sb.push(s.slice(start, bytes.len()))
+    sb.push("\"")
+
+## Whether bytes[i..] encode a marker character, U+10FE80 to U+10FEFF.
+pub fn is_marker_at(bytes: List[u8], i: usize) -> bool:
+    i + 3 < bytes.len() && bytes[i] == 0xF4 && bytes[i + 1] == 0x8F && (bytes[i + 2] == 0xBA || bytes[i + 2] == 0xBB)
+
+fn encode_array(sb: *mut StringBuilder, a: *mut ArrBox, limit: usize) -> void:
+    sb.push("[")
+    for (i, v) in a.items.iter().enumerate():
+        if i > 0:
+            sb.push(",")
+        encode(sb, v, limit)
+        if limit > 0 && i >= limit:
+            break
+    sb.push("]")
+
+pub fn sorted_keys(m: Map[string, Value]) -> List[string]:
+    let mut ks: List[string] = m.keys().collect()
+    ks.sort()
+    ks
+
+fn encode_object(sb: *mut StringBuilder, m: *mut ObjBox, limit: usize) -> void:
+    sb.push("{")
+    for (i, k) in sorted_keys(m.fields).iter().enumerate():
+        if i > 0:
+            sb.push(",")
+        encode_string(sb, k, limit)
+        sb.push(":")
+        encode(sb, m.fields[k], limit)
+        if limit > 0 && i >= limit:
+            break
+    sb.push("}")
+
+## The encoding cut short after about `n` bytes (for Preview, which only
+## needs the first 32 bytes of possibly huge values).
+pub fn json_limited_marshal(v: Value, n: usize) -> string:
+    sb := StringBuilder::new()
+    encode(sb, v, n)
+    text := sb.build()
+    if text.len() <= n:
+        return text
+    # cut at a byte boundary like the limited writer does
+    let bytes: List[u8] = text.bytes().collect()
+    let out = n
+    while out > 0 && (bytes[out] & 0xC0) == 0x80:
+        out -= 1
+    # keep the partial rune bytes: Preview trims invalid trailing runes itself
+    text.slice(0, out)

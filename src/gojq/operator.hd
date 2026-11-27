@@ -1,0 +1,255 @@
+## Port of gojq/operator.go: unary and binary operators.
+use pkg.goshim.value.{Value, ArrBox, ObjBox, arr, obj}
+use pkg.goshim.bigint
+use pkg.goshim.bigint.BigInt
+use pkg.gojq.number.{parse_number, to_float64, big_to_float, float_to_int}
+use pkg.gojq.error.JqError
+use pkg.gojq.compare.{compare, lt}
+use pkg.gojq.func.split_string
+
+## The cases of binopTypeSwitch (gojq passes one callback per case).
+pub enum Binop:
+    Ints(l: i64, r: i64)
+    Floats(l: f64, r: f64)
+    BigInts(l: BigInt, r: BigInt)
+    Strings(l: string, r: string)
+    Arrays(l: *mut ArrBox, r: *mut ArrBox)
+    Maps(l: *mut ObjBox, r: *mut ObjBox)
+    Fallback(l: Value, r: Value)
+
+pub fn binop_type_switch(l0: Value, r0: Value) -> Binop:
+    let l = l0
+    let r = r0
+    match l:
+        .Number(s) => l = parse_number(s)
+        _ => pass
+    match r:
+        .Number(s) => r = parse_number(s)
+        _ => pass
+    match (l, r):
+        (.Int(a), .Int(b)) => .Ints(a, b)
+        (.Int(a), .Float(b)) => .Floats(f64(a), b)
+        (.Int(a), .Big(b)) => .BigInts(bigint.from_i64(a), b)
+        (.Float(a), .Int(b)) => .Floats(a, f64(b))
+        (.Float(a), .Float(b)) => .Floats(a, b)
+        (.Float(a), .Big(b)) => .Floats(a, big_to_float(b))
+        (.Big(a), .Int(b)) => .BigInts(a, bigint.from_i64(b))
+        (.Big(a), .Float(b)) => .Floats(big_to_float(a), b)
+        (.Big(a), .Big(b)) => .BigInts(a, b)
+        (.Str(a), .Str(b)) => .Strings(a, b)
+        (.Arr(a), .Arr(b)) => .Arrays(a, b)
+        (.Obj(a), .Obj(b)) => .Maps(a, b)
+        _ => .Fallback(l, r)
+
+fn big_value(b: BigInt) -> Value:
+    .Big(b)
+
+pub fn func_op_plus(v: Value) -> Result[Value, JqError]:
+    match v:
+        .Int(_) => .Ok(v)
+        .Float(_) => .Ok(v)
+        .Big(_) => .Ok(v)
+        .Number(_) => .Ok(v)
+        _ => .Err(.UnaryType("plus", v))
+
+fn negate(v: i64) -> Value:
+    if v == -9223372036854775807 - 1:
+        return .Big(bigint.negate(bigint.from_i64(v)))
+    .Int(-v)
+
+pub fn func_op_negate(v: Value) -> Result[Value, JqError]:
+    match v:
+        .Int(i) => .Ok(negate(i))
+        .Float(f) => .Ok(.Float(-f))
+        .Big(b) => .Ok(.Big(bigint.negate(b)))
+        .Number(s) =>
+            if s.starts_with("-"):
+                return .Ok(.Number(s.slice(1, s.len())))
+            .Ok(.Number("-" + s))
+        _ => .Err(.UnaryType("negate", v))
+
+pub fn func_op_add(l: Value, r: Value) -> Result[Value, JqError]:
+    match binop_type_switch(l, r):
+        .Ints(a, b) =>
+            match a.checked_add(b):
+                .Some(v) => .Ok(.Int(v))
+                .None => .Ok(.Big(bigint.add(bigint.from_i64(a), bigint.from_i64(b))))
+        .Floats(a, b) => .Ok(.Float(a + b))
+        .BigInts(a, b) => .Ok(.Big(bigint.add(a, b)))
+        .Strings(a, b) => .Ok(.Str(a + b))
+        .Arrays(la, ra) =>
+            if la.items.is_empty():
+                return .Ok(r)
+            if ra.items.is_empty():
+                return .Ok(l)
+            let mut v = la.items
+            v.extend(ra.items)
+            .Ok(arr(v))
+        .Maps(lm, rm) =>
+            if lm.fields.is_empty():
+                return .Ok(r)
+            if rm.fields.is_empty():
+                return .Ok(l)
+            let mut m = lm.fields
+            for (k, x) in rm.fields:
+                m[*k] = *x
+            .Ok(obj(m))
+        .Fallback(a, b) =>
+            match a:
+                .Null => return .Ok(b)
+                _ => pass
+            match b:
+                .Null => return .Ok(a)
+                _ => pass
+            .Err(.BinopType("add", a, b))
+
+pub fn func_op_sub(l: Value, r: Value) -> Result[Value, JqError]:
+    match binop_type_switch(l, r):
+        .Ints(a, b) =>
+            match a.checked_sub(b):
+                .Some(v) => .Ok(.Int(v))
+                .None => .Ok(.Big(bigint.sub(bigint.from_i64(a), bigint.from_i64(b))))
+        .Floats(a, b) => .Ok(.Float(a - b))
+        .BigInts(a, b) => .Ok(.Big(bigint.sub(a, b)))
+        .Strings(a, b) => .Err(.BinopType("subtract", .Str(a), .Str(b)))
+        .Arrays(la, ra) =>
+            let mut v: List[Value] = []
+            for x in la.items:
+                let found = false
+                for y in ra.items:
+                    if compare(x, y) == 0:
+                        found = true
+                        break
+                if !found:
+                    v.push(x)
+            .Ok(arr(v))
+        .Maps(_, _) => .Err(.BinopType("subtract", l, r))
+        .Fallback(a, b) => .Err(.BinopType("subtract", a, b))
+
+pub fn func_op_mul(l: Value, r: Value) -> Result[Value, JqError]:
+    match binop_type_switch(l, r):
+        .Ints(a, b) =>
+            if b == -1:
+                return .Ok(negate(a))
+            match a.checked_mul(b):
+                .Some(v) => .Ok(.Int(v))
+                .None => .Ok(.Big(bigint.mul(bigint.from_i64(a), bigint.from_i64(b))))
+        .Floats(a, b) => .Ok(.Float(a * b))
+        .BigInts(a, b) => .Ok(.Big(bigint.mul(a, b)))
+        .Strings(a, b) => .Err(.BinopType("multiply", .Str(a), .Str(b)))
+        .Arrays(_, _) => .Err(.BinopType("multiply", l, r))
+        .Maps(lm, rm) => .Ok(obj(deep_merge_objects(lm.fields, rm.fields)))
+        .Fallback(a, b) =>
+            match a:
+                .Str(s) =>
+                    match to_float64(b):
+                        .Some(n) => return repeat_string(s, n)
+                        .None => pass
+                _ => pass
+            match b:
+                .Str(s) =>
+                    match to_float64(a):
+                        .Some(n) => return repeat_string(s, n)
+                        .None => pass
+                _ => pass
+            .Err(.BinopType("multiply", a, b))
+
+fn deep_merge_objects(l: Map[string, Value], r: Map[string, Value]) -> Map[string, Value]:
+    let mut m = l
+    for (k, v0) in r:
+        let v = *v0
+        match m.get(*k):
+            .Some(.Obj(mk)) =>
+                match v:
+                    .Obj(w) => v = obj(deep_merge_objects(mk.fields, w.fields))
+                    _ => pass
+            _ => pass
+        m[*k] = v
+    m
+
+fn repeat_string(s: string, n: f64) -> Result[Value, JqError]:
+    if lt(n, 0.0):
+        return .Ok(.Null)
+    let c = if n < 2147483647.0: n else: 2147483647.0
+    count := u64(c)
+    if u64(s.len()) * count >= 2147483647u64:
+        return .Err(.RepeatStringTooLarge(s, n))
+    .Ok(.Str(s.repeat(usize(count))))
+
+pub fn func_op_div(l: Value, r: Value) -> Result[Value, JqError]:
+    match binop_type_switch(l, r):
+        .Ints(a, b) =>
+            if b == 0:
+                return .Err(.ZeroDivision(.Int(a), .Int(b)))
+            if b == -1:
+                return .Ok(negate(a))
+            if a % b == 0:
+                return .Ok(.Int(a / b))
+            .Ok(.Float(f64(a) / f64(b)))
+        .Floats(a, b) =>
+            if b == 0.0:
+                return .Err(.ZeroDivision(.Float(a), .Float(b)))
+            .Ok(.Float(a / b))
+        .BigInts(a, b) =>
+            if bigint.is_zero(b):
+                return .Err(.ZeroDivision(.Big(a), .Big(b)))
+            let (d, m) = bigint.divmod(a, b)
+            if bigint.is_zero(m):
+                return .Ok(.Big(d))
+            .Ok(.Float(big_to_float(a) / big_to_float(b)))
+        .Strings(a, b) => .Ok(split_string(a, b))
+        .Arrays(_, _) => .Err(.BinopType("divide", l, r))
+        .Maps(_, _) => .Err(.BinopType("divide", l, r))
+        .Fallback(a, b) => .Err(.BinopType("divide", a, b))
+
+pub fn func_op_mod(l: Value, r: Value) -> Result[Value, JqError]:
+    match binop_type_switch(l, r):
+        .Ints(a, b) =>
+            if b == 0:
+                return .Err(.ZeroModulo(.Int(a), .Int(b)))
+            if b == -1:
+                return .Ok(.Int(0))
+            .Ok(.Int(a % b))
+        .Floats(a, b) =>
+            if a.is_nan() || b.is_nan():
+                return .Ok(.Float(0.0 / 0.0))
+            ri := float_to_int(b)
+            if ri == 0:
+                return .Err(.ZeroModulo(.Float(a), .Float(b)))
+            # Go's `%` on ints: ri == -1 cannot overflow except for MinInt
+            if ri == -1:
+                return .Ok(.Int(0))
+            .Ok(.Int(float_to_int(a) % ri))
+        .BigInts(a, b) =>
+            if bigint.is_zero(b):
+                return .Err(.ZeroModulo(.Big(a), .Big(b)))
+            let (_, m) = bigint.divmod(a, b)
+            .Ok(.Big(m))
+        .Strings(a, b) => .Err(.BinopType("modulo", .Str(a), .Str(b)))
+        .Arrays(_, _) => .Err(.BinopType("modulo", l, r))
+        .Maps(_, _) => .Err(.BinopType("modulo", l, r))
+        .Fallback(a, b) => .Err(.BinopType("modulo", a, b))
+
+pub fn func_op_alt(l: Value, r: Value) -> Result[Value, JqError]:
+    match l:
+        .Null => .Ok(r)
+        .Bool(false) => .Ok(r)
+        _ => .Ok(l)
+
+pub fn func_op_eq(l: Value, r: Value) -> Result[Value, JqError]:
+    .Ok(.Bool(compare(l, r) == 0))
+
+pub fn func_op_ne(l: Value, r: Value) -> Result[Value, JqError]:
+    .Ok(.Bool(compare(l, r) != 0))
+
+pub fn func_op_gt(l: Value, r: Value) -> Result[Value, JqError]:
+    .Ok(.Bool(compare(l, r) > 0))
+
+pub fn func_op_lt(l: Value, r: Value) -> Result[Value, JqError]:
+    .Ok(.Bool(compare(l, r) < 0))
+
+pub fn func_op_ge(l: Value, r: Value) -> Result[Value, JqError]:
+    .Ok(.Bool(compare(l, r) >= 0))
+
+pub fn func_op_le(l: Value, r: Value) -> Result[Value, JqError]:
+    .Ok(.Bool(compare(l, r) <= 0))

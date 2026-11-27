@@ -1,0 +1,189 @@
+## Port of gojq/module_loader.go. os.UserHomeDir and os.Executable are
+## given by the caller: the home directory (`.None` when unset) and no
+## executable path, since a WebAssembly program has none ($ORIGIN paths are
+## skipped, as Go skips them when os.Executable fails).
+use std.fs.{FsRead, FsError, EntryKind, read_bytes, stat}
+use std.path.Path
+use pkg.goshim.value.{Value, arr}
+use pkg.goshim.json.new_decoder
+use pkg.goshim.encoding.lossy
+use pkg.goshim.strconv.quote
+use pkg.gojq.query.{Query, const_term_to_string}
+use pkg.gojq.parser.parse
+use pkg.gojq.error.JqError
+use pkg.gojq.compiler.ModuleLoader
+
+pub struct LocalModuleLoader:
+    paths: List[string]
+    home: string?
+
+## NewModuleLoader creates a module loader of local modules in the paths.
+pub fn new_module_loader(paths: List[string], home: string?) -> *mut LocalModuleLoader:
+    let mut ps: List[string] = []
+    for path in paths:
+        p := resolve_path(path, "", home)
+        if p != "":
+            ps.push(p)
+    box(LocalModuleLoader { paths: ps, home: home })
+
+fn read_file!(path: string) -> Result[string, JqError] $ FsRead:
+    match read_bytes!(Path(path)):
+        .Ok(b) => .Ok(lossy(b))
+        .Err(e) => .Err(.Message(fs_error_string("open", path, e)))
+
+## The text of an *os.PathError.
+pub fn fs_error_string(op: string, path: string, e: FsError) -> string:
+    match e:
+        .NotFound(_) => "$op $path: no such file or directory"
+        .PermissionDenied(_) => "$op $path: permission denied"
+        .IsADirectory(_) => "read $path: is a directory"
+        .NotADirectory(_) => "$op $path: not a directory"
+        _ => "$op $path: input/output error"
+
+fn exists!(path: string) -> bool $ FsRead:
+    match stat!(Path(path)):
+        .Ok(.Some(_)) => true
+        _ => false
+
+fn is_dir!(path: string) -> bool $ FsRead:
+    match stat!(Path(path)):
+        .Ok(.Some(e)) =>
+            match e.kind:
+                .Directory => true
+                _ => false
+        _ => false
+
+impl ModuleLoader for LocalModuleLoader:
+    fn load_init_modules!(&mut self) -> Result[List[*mut Query], JqError] $ FsRead:
+        let mut qs: List[*mut Query] = []
+        for path in self.paths:
+            if base(path) != ".jq":
+                continue
+            if !exists!(path):
+                continue
+            if is_dir!(path):
+                continue
+            cnt := read_file!(path)?
+            match parse_module(cnt, dir(path), self.home):
+                .Ok(q) => qs.push(q)
+                .Err(e) => return .Err(.QueryParse(path, cnt, box(e)))
+        .Ok(qs)
+
+    fn load_module_with_meta!(&mut self, name: string, meta: Map[string, Value]?) -> Result[*mut Query, JqError] $ FsRead:
+        path := self.lookup_module!(name, ".jq", meta)?
+        cnt := read_file!(path)?
+        match parse_module(cnt, dir(path), self.home):
+            .Ok(q) => .Ok(q)
+            .Err(e) => .Err(.QueryParse(path, cnt, box(e)))
+
+    fn load_json_with_meta!(&mut self, name: string, meta: Map[string, Value]?) -> Result[Value, JqError] $ FsRead:
+        path := self.lookup_module!(name, ".json", meta)?
+        cnt := read_file!(path)?
+        let mut vals: List[Value] = []
+        dec := new_decoder(cnt)
+        while true:
+            match dec.decode():
+                .Ok(.Some(v)) => vals.push(v)
+                .Ok(.None) => break
+                .Err(e) =>
+                    let err: JqError = match e:
+                        .Syntax(msg, off) => .JsonSyntax(msg, off)
+                        .UnexpectedEOF => .UnexpectedEOF
+                    return .Err(.JsonParse(path, cnt, box(err)))
+        .Ok(arr(vals))
+
+impl LocalModuleLoader:
+    fn lookup_module!(&self, name: string, extension: string, meta: Map[string, Value]?) -> Result[string, JqError] $ FsRead:
+        let mut paths = self.paths
+        match meta:
+            .Some(m) =>
+                match m.get("search"):
+                    .Some(.Str(p0)) =>
+                        p := resolve_path(p0, "", self.home)
+                        if p != "":
+                            let mut ps = [p]
+                            ps.extend(paths)
+                            paths = ps
+                    _ => pass
+            .None => pass
+        for b in paths:
+            let path = join_path(b, name + extension)
+            if exists!(path):
+                return .Ok(path)
+            path = join_path(join_path(b, name), base(name) + extension)
+            if exists!(path):
+                return .Ok(path)
+        .Err(.Message("module not found: ${quote(name)}"))
+
+fn parse_module(cnt: string, d: string, home: string?) -> Result[*mut Query, JqError]:
+    q := parse(cnt)?
+    for i in q.imports:
+        match i.meta:
+            .Some(m) =>
+                for e in m.key_vals:
+                    if e.key == "search" || e.key_string == "search":
+                        match const_term_to_string(e.val):
+                            .Some(path) =>
+                                p := resolve_path(path, d, home)
+                                if p != "":
+                                    e.val.str = p
+                                else:
+                                    e.val.null = true
+                            .None => pass
+            .None => pass
+    .Ok(q)
+
+fn resolve_path(path: string, d: string, home: string?) -> string:
+    if path.starts_with("/"):
+        return path
+    if path.starts_with("~/"):
+        return match home:
+            .Some(h) => join_path(h, path.slice(2, path.len()))
+            .None => ""
+    if path.starts_with("\$ORIGIN/"):
+        return ""
+    join_path(d, path)
+
+## filepath.Join
+pub fn join_path(a: string, b: string) -> string:
+    if a == "":
+        return clean(b)
+    if b == "":
+        return clean(a)
+    clean(a + "/" + b)
+
+## filepath.Clean
+pub fn clean(path: string) -> string:
+    if path == "":
+        return "."
+    rooted := path.starts_with("/")
+    let mut out: List[string] = []
+    for part in path.split("/"):
+        if part == "" || part == ".":
+            continue
+        if part == "..":
+            if !out.is_empty() && out[out.len() - 1] != "..":
+                _ := out.pop()
+            else if !rooted:
+                out.push("..")
+            continue
+        out.push(part)
+    s := out.join("/")
+    if rooted:
+        return "/" + s
+    if s == "": "." else: s
+
+## filepath.Base
+pub fn base(path: string) -> string:
+    let p = path
+    while p.len() > 1 && p.ends_with("/"):
+        p = p.slice(0, p.len() - 1)
+    match p.rfind("/"):
+        .Some(i) => if p.len() == 1: p else: p.slice(i + 1, p.len())
+        .None => if p == "": "." else: p
+
+## filepath.Dir
+pub fn dir(path: string) -> string:
+    match path.rfind("/"):
+        .Some(i) => clean(path.slice(0, i + 1))
+        .None => "."

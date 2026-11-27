@@ -1,0 +1,33 @@
+## Shim for github.com/mattn/go-runewidth StringWidth: East Asian wide and
+## fullwidth characters count two columns, combining marks and controls none.
+
+fn is_wide(c: char) -> bool:
+    u := c.to_u32()
+    (
+        (u >= 0x1100 && u <= 0x115F)
+        || (u >= 0x2E80 && u <= 0x303E)
+        || (u >= 0x3041 && u <= 0x33FF)
+        || (u >= 0x3400 && u <= 0x4DBF)
+        || (u >= 0x4E00 && u <= 0x9FFF)
+        || (u >= 0xA000 && u <= 0xA4CF)
+        || (u >= 0xAC00 && u <= 0xD7A3)
+        || (u >= 0xF900 && u <= 0xFAFF)
+        || (u >= 0xFE30 && u <= 0xFE4F)
+        || (u >= 0xFF00 && u <= 0xFF60)
+        || (u >= 0xFFE0 && u <= 0xFFE6)
+        || (u >= 0x1F300 && u <= 0x1F64F)
+        || (u >= 0x1F900 && u <= 0x1F9FF)
+        || (u >= 0x20000 && u <= 0x3FFFD)
+    )
+
+fn is_zero_width(c: char) -> bool:
+    u := c.to_u32()
+    u < 0x20 || (u >= 0x7F && u < 0xA0) || (u >= 0x300 && u <= 0x36F) || (u >= 0x200B && u <= 0x200F)
+
+pub fn string_width(s: string) -> i64:
+    let w = 0i64
+    for c in s.chars():
+        if is_zero_width(c):
+            continue
+        w += if is_wide(c): 2 else: 1
+    w

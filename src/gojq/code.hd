@@ -1,0 +1,147 @@
+## Port of gojq/code.go: bytecode instructions.
+use pkg.goshim.value.Value
+use pkg.gojq.iter.Item
+use pkg.gojq.preview.preview
+
+@derive(Eq, Debug)
+pub enum Opcode:
+    OpNop
+    OpPush
+    OpPop
+    OpDup
+    OpConst
+    OpLoad
+    OpStore
+    OpObject
+    OpAppend
+    OpFork
+    OpForkTryBegin
+    OpForkTryEnd
+    OpForkAlt
+    OpForkLabel
+    OpBacktrack
+    OpJump
+    OpJumpIfNot
+    OpIndex
+    OpIndexArray
+    OpCall
+    OpCallRec
+    OpPushPc
+    OpCallPc
+    OpScope
+    OpRet
+    OpIter
+    OpExpBegin
+    OpExpEnd
+    OpPathBegin
+    OpPathEnd
+
+## The callbacks gojq keeps as Go closures in `opcall` operands. The
+## argFuncN and mathFuncN closures are kept as their function and name.
+pub enum Callback:
+    ## argFunc0(nil) and friends: compiled specially, never called
+    Nil
+    Arg0(f: fn(Value) -> Item)
+    Arg1(f: fn(Value, Value) -> Item)
+    Arg2(f: fn(Value, Value, Value) -> Item)
+    Arg3(f: fn(Value, Value, Value, Value) -> Item)
+    ## a callback taking the argument list as is (flatten, _range, error...)
+    Args(f: fn(Value, List[Value]) -> Item)
+    Math1(name: string, f: fn(f64) -> f64)
+    Math2(name: string, f: fn(f64, f64) -> f64)
+    Math3(name: string, f: fn(f64, f64, f64) -> f64)
+    ## funcBreak(label)
+    Break(label: string)
+    ## the compiler's builtins, input, modulemeta and _match closures
+    Builtins
+    Input
+    Modulemeta
+    Match
+    ## a function given with WithFunction
+    Custom(name: string)
+    ## compileAssign and compileModify helpers
+    Allocator
+    SetpathAlloc
+    GetpathAlloc
+    DelpathsAlloc
+    ## functions reading time.Local or the clock (localtime, strflocaltime,
+    ## strptime, now)
+    Local(name: string)
+
+## The `v any` operand of a code.
+pub enum Operand:
+    NoArg
+    ## a program counter or a count
+    Int(n: i64)
+    ## a variable: [2]int{scope id, index}
+    Var(scope: i64, index: i64)
+    ## opscope: [3]int{scope id, variable count, arity}
+    Scope(id: i64, count: i64, arity: i64)
+    ## a constant value
+    Val(v: Value)
+    ## opcall of a native function: [3]any{callback, argcount, name}
+    Call(f: Callback, argc: i64, name: string)
+
+pub struct Code:
+    pub op: Opcode
+    pub v: Operand = .NoArg
+
+pub fn code(op: Opcode, v: Operand) -> Code:
+    Code { op: op, v: v }
+
+pub fn code0(op: Opcode) -> Code:
+    Code { op: op }
+
+## opcode.String
+pub fn op_name(op: Opcode) -> string:
+    match op:
+        .OpNop => "nop"
+        .OpPush => "push"
+        .OpPop => "pop"
+        .OpDup => "dup"
+        .OpConst => "const"
+        .OpLoad => "load"
+        .OpStore => "store"
+        .OpObject => "object"
+        .OpAppend => "append"
+        .OpFork => "fork"
+        .OpForkTryBegin => "forktrybegin"
+        .OpForkTryEnd => "forktryend"
+        .OpForkAlt => "forkalt"
+        .OpForkLabel => "forklabel"
+        .OpBacktrack => "backtrack"
+        .OpJump => "jump"
+        .OpJumpIfNot => "jumpifnot"
+        .OpIndex => "index"
+        .OpIndexArray => "indexarray"
+        .OpCall => "call"
+        .OpCallRec => "callrec"
+        .OpPushPc => "pushpc"
+        .OpCallPc => "callpc"
+        .OpScope => "scope"
+        .OpRet => "ret"
+        .OpIter => "iter"
+        .OpExpBegin => "expbegin"
+        .OpExpEnd => "expend"
+        .OpPathBegin => "pathbegin"
+        .OpPathEnd => "pathend"
+
+## debugOperand (debug.go)
+pub fn debug_operand(c: Code) -> string:
+    match c.v:
+        .NoArg => "null"
+        .Int(n) => "$n"
+        .Var(a, b) => "[$a,$b]"
+        .Scope(a, b, d) => "[$a,$b,$d]"
+        .Val(v) => preview(v)
+        .Call(_, argc, name) => "$name/$argc"
+
+## env.debugCodes, without the code info names
+pub fn debug_codes(codes: List[*Code]) -> string:
+    let mut lines: List[string] = []
+    for (i, c) in codes.iter().enumerate():
+        name := op_name(c.op)
+        pad := if name.len() < 25: " ".repeat(25 - name.len()) else: ""
+        lines.push("\t$i\t$name$pad${debug_operand(*c)}")
+    lines.push("\t" + "-".repeat(40) + "+")
+    lines.join("\n") + "\n"

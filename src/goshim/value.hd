@@ -1,0 +1,74 @@
+## Go's `any` as gojq uses it for JSON values: nil, bool, int, float64,
+## *big.Int, json.Number, string, []any and map[string]any.
+##
+## Slices and maps are reference types in Go, and gojq depends on that (path
+## tracking compares their identity; the allocator updates fresh ones in
+## place), so arrays and objects are boxes here. `alloc` and `gen` record
+## which allocator made the box, standing in for gojq's address set.
+use pkg.goshim.bigint.BigInt
+
+pub struct ArrBox:
+    pub items: List[Value]
+    pub alloc: (*mut Allocator)? = .None
+    pub gen: i64 = 0
+
+pub struct ObjBox:
+    pub fields: Map[string, Value]
+    pub alloc: (*mut Allocator)? = .None
+    pub gen: i64 = 0
+
+## gojq's `allocator`: the containers it made may be updated in place.
+## Clearing it starts a new generation, so earlier boxes no longer count.
+pub struct Allocator:
+    pub gen: i64 = 1
+
+pub enum Value:
+    Null
+    Bool(b: bool)
+    Int(i: i64)
+    Float(f: f64)
+    Big(b: BigInt)
+    ## json.Number: a number kept as its source text
+    Number(s: string)
+    Str(s: string)
+    Arr(a: *mut ArrBox)
+    Obj(m: *mut ObjBox)
+    ## struct{}: the placeholder delpaths puts in the places it deletes
+    Hole
+
+pub fn arr(items: List[Value]) -> Value:
+    .Arr(box(ArrBox { items: items }))
+
+pub fn obj(fields: Map[string, Value]) -> Value:
+    .Obj(box(ObjBox { fields: fields }))
+
+pub fn empty_obj() -> Value:
+    .Obj(box(ObjBox { fields: {} }))
+
+pub fn is_nil(v: Value) -> bool:
+    match v:
+        .Null => true
+        _ => false
+
+## `v == nil || v == false`
+pub fn is_falsy(v: Value) -> bool:
+    match v:
+        .Null => true
+        .Bool(b) => !b
+        _ => false
+
+## Go's interface equality `v == w` for the comparable dynamic types; slices
+## and maps compare by identity (gojq only reaches this after checking them).
+pub fn same(v: Value, w: Value) -> bool:
+    match (v, w):
+        (.Null, .Null) => true
+        (.Bool(a), .Bool(b)) => a == b
+        (.Int(a), .Int(b)) => a == b
+        (.Float(a), .Float(b)) => a == b
+        (.Big(a), .Big(b)) => a == b
+        (.Number(a), .Number(b)) => a == b
+        (.Str(a), .Str(b)) => a == b
+        (.Arr(a), .Arr(b)) => a is b
+        (.Obj(a), .Obj(b)) => a is b
+        (.Hole, .Hole) => true
+        _ => false

@@ -1,0 +1,47 @@
+## Port of gojq/stack.go: a stack that keeps popped blocks for backtracking.
+
+struct Block[T]:
+    value: T
+    next: i64
+
+pub struct Stack[T]:
+    data: List[Block[T]]
+    pub index: i64
+    pub limit: i64
+
+impl[T] Stack[T]:
+    pub fn new() -> Stack[T]:
+        Stack { data: [], index: -1, limit: -1 }
+
+    pub fn push(&mut self, v: T) -> void:
+        b := Block { value: v, next: self.index }
+        self.index = (if self.index > self.limit: self.index else: self.limit) + 1
+        if self.index < i64(self.data.len()):
+            self.data[usize(self.index)] = b
+        else:
+            self.data.push(b)
+
+    pub fn pop(&mut self) -> T:
+        b := self.data[usize(self.index)]
+        self.index = b.next
+        b.value
+
+    pub fn top(&self) -> T:
+        self.data[usize(self.index)].value
+
+    pub fn at(&self, i: i64) -> T:
+        self.data[usize(i)].value
+
+    pub fn empty(&self) -> bool:
+        self.index < 0
+
+    pub fn save(&mut self) -> (i64, i64):
+        index := self.index
+        limit := self.limit
+        if self.index > self.limit:
+            self.limit = self.index
+        (index, limit)
+
+    pub fn restore(&mut self, index: i64, limit: i64) -> void:
+        self.index = index
+        self.limit = limit

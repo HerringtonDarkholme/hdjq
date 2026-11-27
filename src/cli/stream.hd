@@ -1,0 +1,107 @@
+## Port of gojq/cli/stream.go: the token stream of --stream.
+use pkg.goshim.value.{Value, arr, obj}
+use pkg.goshim.json.{Decoder, Token, JsonErr}
+
+JSON_STATE_TOP_VALUE := 0i64
+JSON_STATE_ARRAY_START := 1i64
+JSON_STATE_ARRAY_VALUE := 2i64
+JSON_STATE_ARRAY_END := 3i64
+JSON_STATE_ARRAY_EMPTY_END := 4i64
+JSON_STATE_OBJECT_START := 5i64
+JSON_STATE_OBJECT_KEY := 6i64
+JSON_STATE_OBJECT_VALUE := 7i64
+JSON_STATE_OBJECT_END := 8i64
+JSON_STATE_OBJECT_EMPTY_END := 9i64
+
+pub struct JsonStream:
+    dec: *mut Decoder
+    path: List[Value] = []
+    states: List[i64] = [0]
+
+pub fn new_json_stream(dec: *mut Decoder) -> *mut JsonStream:
+    box(JsonStream { dec: dec })
+
+## The result of next(): a value, the end of input (io.EOF), or an error.
+pub enum StreamNext:
+    V(v: Value)
+    Eof
+    Err(e: JsonErr)
+
+impl JsonStream:
+    fn top(&self) -> i64:
+        self.states[self.states.len() - 1]
+
+    fn set_top(&mut self, s: i64) -> void:
+        n := self.states.len()
+        self.states[n - 1] = s
+
+    fn copy_path(&self) -> Value:
+        arr(self.path)
+
+    pub fn next(&mut self) -> StreamNext:
+        let t = self.top()
+        if t == JSON_STATE_ARRAY_END || t == JSON_STATE_OBJECT_END:
+            _ := self.path.pop()
+        if t == JSON_STATE_ARRAY_END || t == JSON_STATE_OBJECT_END || t == JSON_STATE_ARRAY_EMPTY_END || t == JSON_STATE_OBJECT_EMPTY_END:
+            _ := self.states.pop()
+        while true:
+            let token = match self.dec.token():
+                .Ok(.Some(tk)) => tk
+                .Ok(.None) =>
+                    if self.top() != JSON_STATE_TOP_VALUE:
+                        return .Err(.UnexpectedEOF)
+                    return .Eof
+                .Err(e) => return .Err(e)
+            let is_close = match token:
+                .Delim(d) => d == ']' || d == '}'
+                .Val(_) => false
+            if !is_close:
+                s := self.top()
+                if s == JSON_STATE_ARRAY_VALUE:
+                    n := self.path.len()
+                    match self.path[n - 1]:
+                        .Int(i) => self.path[n - 1] = .Int(i + 1)
+                        _ => pass
+                else if s == JSON_STATE_OBJECT_VALUE:
+                    _ := self.path.pop()
+            match token:
+                .Delim(d) =>
+                    if d == '[' || d == '{':
+                        s := self.top()
+                        if s == JSON_STATE_ARRAY_START:
+                            self.set_top(JSON_STATE_ARRAY_VALUE)
+                        else if s == JSON_STATE_OBJECT_KEY:
+                            self.set_top(JSON_STATE_OBJECT_VALUE)
+                        if d == '[':
+                            self.states.push(JSON_STATE_ARRAY_START)
+                            self.path.push(.Int(0))
+                        else:
+                            self.states.push(JSON_STATE_OBJECT_START)
+                    else if d == ']':
+                        if self.top() == JSON_STATE_ARRAY_START:
+                            self.set_top(JSON_STATE_ARRAY_EMPTY_END)
+                            _ := self.path.pop()
+                            return .V(arr([self.copy_path(), arr([])]))
+                        self.set_top(JSON_STATE_ARRAY_END)
+                        return .V(arr([self.copy_path()]))
+                    else:
+                        if self.top() == JSON_STATE_OBJECT_START:
+                            self.set_top(JSON_STATE_OBJECT_EMPTY_END)
+                            return .V(arr([self.copy_path(), obj({})]))
+                        self.set_top(JSON_STATE_OBJECT_END)
+                        return .V(arr([self.copy_path()]))
+                .Val(v) =>
+                    s := self.top()
+                    if s == JSON_STATE_ARRAY_START || s == JSON_STATE_ARRAY_VALUE:
+                        self.set_top(JSON_STATE_ARRAY_VALUE)
+                        return .V(arr([self.copy_path(), v]))
+                    else if s == JSON_STATE_OBJECT_START || s == JSON_STATE_OBJECT_VALUE:
+                        self.set_top(JSON_STATE_OBJECT_KEY)
+                        self.path.push(v)
+                    else if s == JSON_STATE_OBJECT_KEY:
+                        self.set_top(JSON_STATE_OBJECT_VALUE)
+                        return .V(arr([self.copy_path(), v]))
+                    else:
+                        self.set_top(JSON_STATE_TOP_VALUE)
+                        return .V(arr([self.copy_path(), v]))
+        .Eof

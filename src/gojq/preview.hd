@@ -1,0 +1,24 @@
+## Port of gojq/preview.go.
+use pkg.goshim.value.Value
+use pkg.gojq.encoder.json_limited_marshal
+
+## Preview returns the preview string of v: the jq-flavored JSON encoding,
+## truncated to 30 bytes.
+pub fn preview(v: Value) -> string:
+    let bs = json_limited_marshal(v, 32)
+    l := 30
+    if bs.len() > l:
+        trailing := match v:
+            .Str(_) => " ...\""
+            .Arr(_) => " ...]"
+            .Obj(_) => " ...}"
+            _ => " ..."
+        let bytes: List[u8] = bs.bytes().collect()
+        let n = bytes.len()
+        while n > l - trailing.len():
+            # drop the last rune
+            n -= 1
+            while n > 0 && (bytes[n] & 0xC0) == 0x80:
+                n -= 1
+        bs = bs.slice(0, n) + trailing
+    bs

@@ -1,0 +1,187 @@
+## Port of gojq/cli/error.go (without the YAML parse error).
+use pkg.goshim.strconv.{quote_rune}
+use pkg.goshim.encoding.{lossy, display}
+use pkg.goshim.runewidth.string_width
+use pkg.gojq.error.{JqError, error_string, exit_code_of}
+
+pub fn exit_code_ok() -> i64: 0
+pub fn exit_code_falsy_err() -> i64: 1
+pub fn exit_code_flag_parse_err() -> i64: 2
+pub fn exit_code_compile_err() -> i64: 3
+pub fn exit_code_no_value_err() -> i64: 4
+pub fn exit_code_default_err() -> i64: 5
+
+## The error a jsonParseError wraps.
+pub enum JsonErrKind:
+    ## *json.SyntaxError
+    Syntax(msg: string, offset: i64)
+    ## io.ErrUnexpectedEOF
+    UnexpectedEOF
+    ## jsonTrailingValueError
+    Trailing(ch: char, offset: i64)
+
+pub enum CliError:
+    ## emptyError: printed by nobody, exits with the code of the error
+    Empty(err: *CliError)
+    ## exitCodeError
+    ExitCode(code: i64)
+    ## flagParseError
+    FlagParse(msg: string)
+    ## compileError
+    Compile(err: JqError)
+    ## queryParseError
+    QueryParse(fname: string, contents: string, err: JqError)
+    ## jsonParseError
+    JsonParse(fname: string, contents: List[u8], line: i64, err: JsonErrKind)
+    ## an error of the gojq package
+    Jq(err: JqError)
+    ## any other error
+    Message(msg: string)
+
+pub fn is_empty_error(e: CliError) -> bool:
+    match e:
+        .Empty(_) => true
+        .ExitCode(_) => true
+        _ => false
+
+## ExitCode(), when the error has one.
+pub fn cli_exit_code(e: CliError) -> i64?:
+    match e:
+        .Empty(inner) => .Some(cli_exit_code(*inner).unwrap_or(exit_code_default_err()))
+        .ExitCode(c) => .Some(c)
+        .FlagParse(_) => .Some(exit_code_flag_parse_err())
+        .Compile(_) => .Some(exit_code_compile_err())
+        .QueryParse(_, _, _) => .Some(exit_code_compile_err())
+        .Jq(err) => exit_code_of(err)
+        _ => .None
+
+pub fn cli_error_string(e: CliError) -> string:
+    match e:
+        .Empty(_) => ""
+        .ExitCode(c) => "exit code: $c"
+        .FlagParse(msg) => msg
+        .Compile(err) => "compile error: " + error_string(err)
+        .QueryParse(fname, contents, err) => query_parse_error_string(fname, contents, err)
+        .JsonParse(fname, contents, line, err) => json_parse_error_string(fname, contents, line, err)
+        .Jq(err) => error_string(err)
+        .Message(msg) => msg
+
+fn json_err_string(e: JsonErrKind) -> string:
+    match e:
+        .Syntax(msg, _) => msg
+        .UnexpectedEOF => "unexpected EOF"
+        .Trailing(ch, _) => "invalid character ${quote_rune(ch)} after top-level value"
+
+fn query_parse_error_string(fname: string, contents: string, err: JqError) -> string:
+    let offset = 0i64
+    match err:
+        .Parse(off, token, _) => offset = off - i64(token.len()) + 1
+        _ => pass
+    let (linestr, line, column) = get_line_by_offset(contents.bytes().collect(), offset)
+    if fname != "<arg>" || contains_newline(contents):
+        return "invalid query: $fname:$line\n${format_line_info(linestr, line, column)}  ${error_string(err)}"
+    "invalid query: $contents\n    $linestr\n    ${pad_char(column + 1)}  ${error_string(err)}"
+
+fn json_parse_error_string(fname: string, contents: List[u8], line0: i64, err: JsonErrKind) -> string:
+    let offset = match err:
+        .UnexpectedEOF => i64(contents.len()) + 1
+        .Syntax(_, off) => off
+        .Trailing(_, off) => off
+    let (linestr, line1, column) = get_line_by_offset(contents, offset)
+    line := line1 + line0
+    if line > 1:
+        return "invalid json: $fname:$line\n${format_line_info(linestr, line, column)}  ${json_err_string(err)}"
+    "invalid json: $fname\n    $linestr\n    ${pad_char(column + 1)}  ${json_err_string(err)}"
+
+## fmt's `%*c` of '^' with the width.
+fn pad_char(width: i64) -> string:
+    if width <= 1:
+        return "^"
+    " ".repeat(usize(width - 1)) + "^"
+
+fn imin(a: i64, b: i64) -> i64:
+    if a < b: a else: b
+
+fn imax(a: i64, b: i64) -> i64:
+    if a > b: a else: b
+
+pub fn get_line_by_offset(str: List[u8], offset0: i64) -> (string, i64, i64):
+    let mut linestr: List[u8] = []
+    let line = 0i64
+    let offset = offset0
+    for (s, start) in string_lines(str):
+        line += 1
+        linestr = s
+        if offset <= start + i64(s.len()) + 1:
+            offset -= start
+            break
+    offset = imin(imax(offset - 1, 0), i64(linestr.len()))
+    if offset > 48:
+        skip := trim_last_invalid_rune(linestr.slice(0, usize(offset - 48))).len()
+        linestr = linestr.slice(skip, linestr.len())
+        offset -= i64(skip)
+    linestr = trim_last_invalid_rune(linestr.slice(0, usize(imin(64, i64(linestr.len())))))
+    if offset < i64(linestr.len()):
+        offset = i64(trim_last_invalid_rune(linestr.slice(0, usize(offset))).len())
+    else:
+        offset = i64(linestr.len())
+    column := string_width(display(lossy(linestr.slice(0, usize(offset)))))
+    (lossy(linestr), line, column)
+
+## stringLines: the lines (as bytes) and their start offsets.
+fn string_lines(b: List[u8]) -> List[(List[u8], i64)]:
+    let mut out: List[(List[u8], i64)] = []
+    let pos = 0usize
+    let offset = 0i64
+    while pos < b.len():
+        rest := b.slice(pos, b.len())
+        let i = index_newline(rest)
+        let mut line: List[u8] = []
+        if i >= 0:
+            line = rest.slice(0, usize(i))
+            let adv = usize(i)
+            if adv + 1 < rest.len() && rest[adv] == 0x0d && rest[adv + 1] == 0x0a:
+                adv += 2
+            else:
+                adv += 1
+            out.push((line, offset))
+            pos += adv
+            offset += i64(adv)
+        else:
+            out.push((rest, offset))
+            pos = b.len()
+    out
+
+fn index_newline(s: List[u8]) -> i64:
+    let n = s.len()
+    let i = -1i64
+    for (k, c) in s.iter().enumerate():
+        if c == 0x0a:
+            i = i64(k)
+            n = k
+            break
+    for k in 0..n:
+        if s[k] == 0x0d:
+            return i64(k)
+    i
+
+fn trim_last_invalid_rune(s: List[u8]) -> List[u8]:
+    let i = i64(s.len()) - 1
+    while i >= 0 && i > i64(s.len()) - 4:
+        b := s[usize(i)]
+        if b < 0x80:
+            return s.slice(0, usize(i) + 1)
+        if (b & 0xC0) != 0x80:
+            need := if b >= 0xF0: 4i64 else if b >= 0xE0: 3 else if b >= 0xC0: 2 else: 1
+            if need == 1 || i + need > i64(s.len()):
+                return s.slice(0, usize(i))
+            break
+        i -= 1
+    s
+
+fn format_line_info(linestr: string, line: i64, column: i64) -> string:
+    l := "$line"
+    "    $l | $linestr\n    ${pad_char(column + i64(l.len()) + 4)}"
+
+fn contains_newline(str: string) -> bool:
+    str.contains("\n") || str.contains("\r")

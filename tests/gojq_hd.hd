@@ -1,0 +1,11 @@
+use std.process.Command
+use std.testing.{assert_equal, hd_run}
+
+it("runs a query"):
+    let out = hd_run!(*Command::new("gojqhd").args(["-nc", "[range(3)] | map(. * 2), add"]))
+    assert_equal(out.stdout, "[0,2,4]\n3\n", reason="query output")
+    assert_equal(out.status, 0, reason="a clean exit")
+
+it("reports a parse error with exit code 3"):
+    let out = hd_run!(*Command::new("gojqhd").args(["-n", "1 +"]))
+    assert_equal(out.status, 3, reason="compile error exit code")

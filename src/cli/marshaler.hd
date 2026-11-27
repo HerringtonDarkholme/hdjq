@@ -1,0 +1,26 @@
+## Port of gojq/cli/marshaler.go (without the YAML marshaler).
+use pkg.goshim.value.Value
+use pkg.goshim.strconv.quote
+use std.fs.FsWrite
+use pkg.cli.encoder.{Encoder, write_raw}
+
+pub enum Marshaler:
+    Enc(e: *mut Encoder)
+    ## rawMarshaler
+    Raw(e: *mut Encoder, check_nul: bool)
+
+pub fn marshal!(m: Marshaler, v: Value, to_err: bool) -> Result[void, string] $ Console + FsWrite:
+    match m:
+        .Enc(e) =>
+            e.marshal(v, to_err)
+            .Ok(())
+        .Raw(e, check_nul) =>
+            match v:
+                .Str(s) =>
+                    if check_nul && s.contains("\u{0}"):
+                        return .Err("cannot output a string containing NUL character: ${quote(s)}")
+                    write_raw!(to_err, s)
+                    .Ok(())
+                _ =>
+                    e.marshal(v, to_err)
+                    .Ok(())
