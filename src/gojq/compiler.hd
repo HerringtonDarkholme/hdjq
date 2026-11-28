@@ -14,7 +14,7 @@ use pkg.gojq.error.JqError
 use pkg.gojq.number.to_number
 use pkg.gojq.lexer.new_lexer
 use pkg.gojq.builtin.builtin_func_defs
-use pkg.gojq.func.{Function, internal_funcs, func_match, RegexpCache, new_regexp_cache, func_allocator, func_setpath_with_allocator, func_getpath_with_allocator, func_delpaths_with_allocator, call_math1, call_math2, call_math3, call_local, func_now}
+use pkg.gojq.func.{Function, internal_funcs, func_match, RegexpCache, new_regexp_cache, func_allocator, func_setpath_with_allocator, func_getpath_with_allocator, func_delpaths_with_allocator, func_now}
 
 ## ModuleLoader is the interface for loading modules.
 pub trait ModuleLoader:
@@ -669,7 +669,7 @@ impl Compiler:
             return .Err(.Break(label, .Null))
         self.append(code0(.OpPop))
         self.append(code(.OpLoad, var_op(v)))
-        self.append(code(.OpCall, .Call(.Break(label), 0, "_break")))
+        self.append(code(.OpCall, .Call(func_break(label), 0, "_break")))
         .Ok(())
 
     fn compile_term!(&mut self, e: *mut Term) -> Result[void, JqError] $ FsRead:
@@ -832,7 +832,10 @@ impl Compiler:
                             n := self.codes.len()
                             self.codes[n - 1] = code0(.OpPathEnd)
                             return .Ok(())
-                        "builtins" => return self.compile_call_internal!(.Call(.Builtins, 0, e.name), e.args, true, -1)
+                        "builtins" =>
+                            rt := self.rt
+                            f := fn(_v: Item, _args: List[Item]) -> Item: .V(func_builtins(rt))
+                            return self.compile_call_internal!(.Call(.Native(f), 0, e.name), e.args, true, -1)
                         "input" =>
                             if !self.has_input:
                                 return .Err(.InputNotAllowed)
@@ -848,7 +851,10 @@ impl Compiler:
                             self.append(code0(.OpBacktrack))
                             self.codes[setfork] = code(.OpFork, .Int(self.len()))
                             return .Ok(())
-                        "_match" => return self.compile_call_internal!(.Call(.Match, argc, e.name), e.args, true, -1)
+                        "_match" =>
+                            cache := self.rt.regexp_cache
+                            f := fn(v: Item, args: List[Item]) -> Item: func_match(val(v), val(args[0]), val(args[1]), val(args[2]), cache)
+                            return self.compile_call_internal!(.Call(.Native(f), argc, e.name), e.args, true, -1)
                         _ => return self.compile_call!(e.name, e.args)
             .None => pass
         match self.custom_funcs.get(e.name):
@@ -885,7 +891,7 @@ impl Compiler:
             code(.OpStore, x),
             code0(.OpExpEnd),
             code(.OpPush, .Val(.Null)),
-            code(.OpCall, .Call(.Allocator, 0, "_allocator")),
+            code(.OpCall, .Call(.Native(func_allocator), 0, "_allocator")),
             code(.OpStore, a),
             code(.OpLoad, v),
             code(.OpFork, .Int(base + 30)),
@@ -901,7 +907,7 @@ impl Compiler:
             code(.OpLoad, x),
             code(.OpLoad, q),
             code(.OpLoad, w),
-            code(.OpCall, .Call(.SetpathAlloc, 3, "_setpath")),
+            code(.OpCall, .Call(.Native(func_setpath_with_allocator), 3, "_setpath")),
             code(.OpStore, w),
             code0(.OpBacktrack),
             code0(.OpPop),
@@ -931,7 +937,7 @@ impl Compiler:
             code(.OpPush, .Val(arr([]))),
             code(.OpStore, d),
             code(.OpPush, .Val(.Null)),
-            code(.OpCall, .Call(.Allocator, 0, "_allocator")),
+            code(.OpCall, .Call(.Native(func_allocator), 0, "_allocator")),
             code(.OpStore, a),
             code(.OpLoad, v),
             code(.OpFork, .Int(base + 40)),
@@ -949,18 +955,18 @@ impl Compiler:
             code(.OpLoad, a),
             code(.OpLoad, p),
             code(.OpLoad, v),
-            code(.OpCall, .Call(.GetpathAlloc, 2, "getpath")),
+            code(.OpCall, .Call(.Native(func_getpath_with_allocator), 2, "getpath")),
             code(.OpLoad, f),
             code0(.OpCallPc),
             code(.OpLoad, p),
             code(.OpLoad, v),
-            code(.OpCall, .Call(.SetpathAlloc, 3, "_setpath")),
+            code(.OpCall, .Call(.Native(func_setpath_with_allocator), 3, "_setpath")),
             code(.OpStore, v),
             code(.OpLoad, v),
             code(.OpFork, .Int(base + 35)),
             code(.OpJump, .Int(base + 39)),
             code(.OpLoad, l),
-            code(.OpCall, .Call(.Break(""), 0, "_break")),
+            code(.OpCall, .Call(func_break(""), 0, "_break")),
             code(.OpLoad, p),
             code(.OpAppend, d),
             code0(.OpBacktrack),
@@ -968,7 +974,7 @@ impl Compiler:
             code(.OpLoad, a),
             code(.OpLoad, d),
             code(.OpLoad, v),
-            code(.OpCall, .Call(.DelpathsAlloc, 2, "_delpaths")),
+            code(.OpCall, .Call(.Native(func_delpaths_with_allocator), 2, "_delpaths")),
             code0(.OpRet),
         ]
         self.codes.extend(codes)
@@ -1392,8 +1398,8 @@ pub fn call_callback!(rt: *mut Runtime, f: Callback, x: Item, args: List[Item]) 
                 .None => .Err(.FuncNotFound(name, i64(args.len())))
         .Input => func_input!(rt)
         .Modulemeta => func_modulemeta!(rt, x)
-        .Local("now") => func_now(now().unix_milliseconds() * 1000000)
-        _ => call_callback_pure(rt, f, x, args)
+        .Now => func_now(now().unix_milliseconds() * 1000000)
+        _ => call_callback_pure(f, x, args)
 
 ## compiler.funcInput
 fn func_input!(rt: *mut Runtime) -> Item $ ConsoleInput + FsRead:
@@ -1404,26 +1410,15 @@ fn func_input!(rt: *mut Runtime) -> Item $ ConsoleInput + FsRead:
                 .None => .Err(.Message("break"))
         .None => .Err(.InputNotAllowed)
 
-## The callbacks that need no input, files or clock.
-pub fn call_callback_pure(rt: *mut Runtime, f: Callback, x: Item, args: List[Item]) -> Item $ Console:
+## A closure callback: a plain call.
+pub fn call_callback_pure(f: Callback, x: Item, args: List[Item]) -> Item:
     match f:
-        .Arg0(g) => g(val(x))
-        .Arg1(g) => g(val(x), val(args[0]))
-        .Arg2(g) => g(val(x), val(args[0]), val(args[1]))
-        .Arg3(g) => g(val(x), val(args[0]), val(args[1]), val(args[2]))
-        .Args(g) => g(val(x), [for a in args => val(a)])
-        .Math1(name, g) => call_math1(name, g, val(x))
-        .Math2(name, g) => call_math2(name, g, val(args[0]), val(args[1]))
-        .Math3(name, g) => call_math3(name, g, val(args[0]), val(args[1]), val(args[2]))
-        .Break(label) => .Err(.Break(label, val(x)))
-        .Builtins => .V(func_builtins(rt))
-        .Match => func_match(val(x), val(args[0]), val(args[1]), val(args[2]), rt.regexp_cache)
-        .Allocator => func_allocator()
-        .SetpathAlloc => func_setpath_with_allocator(x, args)
-        .GetpathAlloc => func_getpath_with_allocator(x, args)
-        .DelpathsAlloc => func_delpaths_with_allocator(x, args)
-        .Local(name) => call_local(name, val(x), [for a in args => val(a)], local())
+        .Native(g) => g(x, args)
         _ => .Err(.Message("unexpected callback"))
+
+## funcBreak(label)
+fn func_break(label: string) -> Callback:
+    .Native(fn(v: Item, _args: List[Item]) -> Item: .Err(.Break(label, val(v))))
 
 fn func_modulemeta!(rt: *mut Runtime, x: Item) -> Item $ FsRead:
     let .V(v) = x else: return .Err(.Message("modulemeta"))

@@ -39,10 +39,12 @@ hd lacks:
 
 ## Where the port differs, and why
 
-- **Closures become data.** Go keeps callbacks as closures in `opcall`
-  operands. Here `Callback` holds a function and its name: `argFunc0`..`3`
-  and `mathFunc` closures. A dispatcher handles the compiler's closures
-  (`builtins`, `input`, `modulemeta`, `_match`, the allocator helpers).
+- **Callbacks are closures, as in Go.** `argFunc0`..`3`, `mathFunc` and the
+  compiler's `funcBuiltins`, `funcMatch` and `funcBreak` build closures that
+  `opcall` operands hold. Four of Go's closures cannot be plain hd closures,
+  since they read input or reach the host: `input`, `modulemeta`, `now` and
+  the functions given with `WithFunction`. They are `Callback` variants,
+  which the VM calls through its waiting `next!`.
 - **Go's `lazy`/`defer` patching** of reserved code slots is an explicit
   reserve-then-patch, applied at the same point Go's defer runs.
 - **Slices and maps are reference types in Go.** gojq relies on that for

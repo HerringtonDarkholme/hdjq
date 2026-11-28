@@ -36,37 +36,16 @@ pub enum Opcode:
     OpPathBegin
     OpPathEnd
 
-## The callbacks gojq keeps as Go closures in `opcall` operands. The
-## argFuncN and mathFuncN closures are kept as their function and name.
+## The callback of an `opcall`. Go keeps a closure, `func(any, []any) any`,
+## and so does Native. Go's closures for input, modulemeta, now and the
+## functions given with WithFunction read input or reach the host, which in
+## hd needs a waiting call, so the VM calls these through `next!`.
 pub enum Callback:
-    ## argFunc0(nil) and friends: compiled specially, never called
-    Nil
-    Arg0(f: fn(Value) -> Item)
-    Arg1(f: fn(Value, Value) -> Item)
-    Arg2(f: fn(Value, Value, Value) -> Item)
-    Arg3(f: fn(Value, Value, Value, Value) -> Item)
-    ## a callback taking the argument list as is (flatten, _range, error...)
-    Args(f: fn(Value, List[Value]) -> Item)
-    Math1(name: string, f: fn(f64) -> f64)
-    Math2(name: string, f: fn(f64, f64) -> f64)
-    Math3(name: string, f: fn(f64, f64, f64) -> f64)
-    ## funcBreak(label)
-    Break(label: string)
-    ## the compiler's builtins, input, modulemeta and _match closures
-    Builtins
+    Native(f: fn(Item, List[Item]) -> Item)
     Input
     Modulemeta
-    Match
-    ## a function given with WithFunction
+    Now
     Custom(name: string)
-    ## compileAssign and compileModify helpers
-    Allocator
-    SetpathAlloc
-    GetpathAlloc
-    DelpathsAlloc
-    ## functions reading time.Local or the clock (localtime, strflocaltime,
-    ## strptime, now)
-    Local(name: string)
 
 ## The `v any` operand of a code.
 pub enum Operand:

@@ -37,196 +37,217 @@ impl Function:
     pub fn accept(&self, cnt: i64) -> bool:
         (self.argcount & (1i64 << u32(cnt))) != 0
 
-fn fun(argcount: i64, callback: Callback) -> Function:
-    Function { argcount: argcount, iter: false, callback: callback }
+fn val(x: Item) -> Value:
+    match x:
+        .V(v) => v
+        _ => Value.Null
 
-fn nil0() -> Function:
-    fun(ARGCOUNT0, .Nil)
+fn fun(argcount: i64, f: fn(Item, List[Item]) -> Item) -> Function:
+    Function { argcount: argcount, iter: false, callback: .Native(f) }
 
-fn nil1() -> Function:
-    fun(ARGCOUNT1, .Nil)
+## argFunc0(nil) and its kind: compiled specially, never called
+fn nil_func(argcount: i64) -> Function:
+    fun(argcount, fn(_x: Item, _args: List[Item]) -> Item: .Err(.Message("unreachable callback")))
 
-fn local(argcount: i64, name: string) -> Function:
-    fun(argcount, .Local(name))
+fn arg_func0(f: fn(Value) -> Item) -> Function:
+    fun(ARGCOUNT0, fn(v: Item, _args: List[Item]) -> Item: f(val(v)))
+
+fn arg_func1(f: fn(Value, Value) -> Item) -> Function:
+    fun(ARGCOUNT1, fn(v: Item, args: List[Item]) -> Item: f(val(v), val(args[0])))
+
+fn arg_func2(f: fn(Value, Value, Value) -> Item) -> Function:
+    fun(ARGCOUNT2, fn(v: Item, args: List[Item]) -> Item: f(val(v), val(args[0]), val(args[1])))
+
+fn arg_func3(f: fn(Value, Value, Value, Value) -> Item) -> Function:
+    fun(ARGCOUNT3, fn(v: Item, args: List[Item]) -> Item: f(val(v), val(args[0]), val(args[1]), val(args[2])))
+
+## a function taking its argument list as is
+fn args_func(argcount: i64, iter: bool, f: fn(Value, List[Value]) -> Item) -> Function:
+    Function { argcount: argcount, iter: iter, callback: .Native(fn(v: Item, args: List[Item]) -> Item: f(val(v), [for a in args => val(a)])) }
+
+fn math_func(name: string, f: fn(f64) -> f64) -> Function:
+    g := fn(v: Value) -> Item:
+        match to_float64(v):
+            .Some(x) => .V(.Float(f(x)))
+            .None => .Err(.Func0Type(name, v))
+    arg_func0(g)
+
+fn math_func2(name: string, f: fn(f64, f64) -> f64) -> Function:
+    g := fn(_v: Value, x: Value, y: Value) -> Item:
+        let .Some(l) = to_float64(x) else: return .Err(.Func0Type(name, x))
+        let .Some(r) = to_float64(y) else: return .Err(.Func0Type(name, y))
+        .V(.Float(f(l, r)))
+    arg_func2(g)
+
+fn math_func3(name: string, f: fn(f64, f64, f64) -> f64) -> Function:
+    g := fn(_v: Value, a: Value, b: Value, c: Value) -> Item:
+        let .Some(x) = to_float64(a) else: return .Err(.Func0Type(name, a))
+        let .Some(y) = to_float64(b) else: return .Err(.Func0Type(name, b))
+        let .Some(z) = to_float64(c) else: return .Err(.Func0Type(name, c))
+        .V(.Float(f(x, y, z)))
+    arg_func3(g)
 
 ## internalFuncs
 pub fn internal_funcs() -> Map[string, Function]:
     {
-        "empty": nil0(),
-        "path": nil1(),
-        "env": nil0(),
-        "builtins": nil0(),
-        "input": nil0(),
-        "modulemeta": nil0(),
-        "debug": nil1(),
-        "length": fun(ARGCOUNT0, .Arg0(func_length)),
-        "utf8bytelength": fun(ARGCOUNT0, .Arg0(func_utf8_byte_length)),
-        "keys": fun(ARGCOUNT0, .Arg0(func_keys)),
-        "has": fun(ARGCOUNT1, .Arg1(func_has)),
-        "add": fun(ARGCOUNT0, .Arg0(func_add)),
-        "toboolean": fun(ARGCOUNT0, .Arg0(func_to_boolean)),
-        "tonumber": fun(ARGCOUNT0, .Arg0(func_to_number)),
-        "tostring": fun(ARGCOUNT0, .Arg0(func_to_string)),
-        "type": fun(ARGCOUNT0, .Arg0(func_type)),
-        "reverse": fun(ARGCOUNT0, .Arg0(func_reverse)),
-        "contains": fun(ARGCOUNT1, .Arg1(func_contains)),
-        "inside": fun(ARGCOUNT1, .Arg1(func_inside)),
-        "indices": fun(ARGCOUNT1, .Arg1(func_indices)),
-        "index": fun(ARGCOUNT1, .Arg1(func_index)),
-        "rindex": fun(ARGCOUNT1, .Arg1(func_rindex)),
-        "startswith": fun(ARGCOUNT1, .Arg1(func_starts_with)),
-        "endswith": fun(ARGCOUNT1, .Arg1(func_ends_with)),
-        "ltrimstr": fun(ARGCOUNT1, .Arg1(func_ltrimstr)),
-        "rtrimstr": fun(ARGCOUNT1, .Arg1(func_rtrimstr)),
-        "trimstr": fun(ARGCOUNT1, .Arg1(func_trimstr)),
-        "ltrim": fun(ARGCOUNT0, .Arg0(func_ltrim)),
-        "rtrim": fun(ARGCOUNT0, .Arg0(func_rtrim)),
-        "trim": fun(ARGCOUNT0, .Arg0(func_trim)),
-        "explode": fun(ARGCOUNT0, .Arg0(func_explode)),
-        "implode": fun(ARGCOUNT0, .Arg0(func_implode)),
-        "split": fun(ARGCOUNT1, .Arg1(func_split)),
-        "join": fun(ARGCOUNT1, .Arg1(func_join)),
-        "ascii_downcase": fun(ARGCOUNT0, .Arg0(func_ascii_downcase)),
-        "ascii_upcase": fun(ARGCOUNT0, .Arg0(func_ascii_upcase)),
-        "tojson": fun(ARGCOUNT0, .Arg0(func_to_json)),
-        "fromjson": fun(ARGCOUNT0, .Arg0(func_from_json)),
-        "format": fun(ARGCOUNT1, .Arg1(func_format)),
-        "_tohtml": fun(ARGCOUNT0, .Arg0(func_to_html)),
-        "_touri": fun(ARGCOUNT0, .Arg0(func_to_uri)),
-        "_tourid": fun(ARGCOUNT0, .Arg0(func_to_urid)),
-        "_tocsv": fun(ARGCOUNT0, .Arg0(func_to_csv)),
-        "_totsv": fun(ARGCOUNT0, .Arg0(func_to_tsv)),
-        "_tosh": fun(ARGCOUNT0, .Arg0(func_to_sh)),
-        "_tobase64": fun(ARGCOUNT0, .Arg0(func_to_base64)),
-        "_tobase64d": fun(ARGCOUNT0, .Arg0(func_to_base64d)),
-        "_index": fun(ARGCOUNT2, .Arg2(func_index2)),
-        "_slice": fun(ARGCOUNT3, .Arg3(func_slice)),
-        "_plus": fun(ARGCOUNT0, .Arg0(func_op_plus_item)),
-        "_negate": fun(ARGCOUNT0, .Arg0(func_op_negate_item)),
-        "_add": fun(ARGCOUNT2, .Arg2(op_add)),
-        "_subtract": fun(ARGCOUNT2, .Arg2(op_sub)),
-        "_multiply": fun(ARGCOUNT2, .Arg2(op_mul)),
-        "_divide": fun(ARGCOUNT2, .Arg2(op_div)),
-        "_modulo": fun(ARGCOUNT2, .Arg2(op_mod)),
-        "_alternative": fun(ARGCOUNT2, .Arg2(op_alt)),
-        "_equal": fun(ARGCOUNT2, .Arg2(op_eq)),
-        "_notequal": fun(ARGCOUNT2, .Arg2(op_ne)),
-        "_greater": fun(ARGCOUNT2, .Arg2(op_gt)),
-        "_less": fun(ARGCOUNT2, .Arg2(op_lt)),
-        "_greatereq": fun(ARGCOUNT2, .Arg2(op_ge)),
-        "_lesseq": fun(ARGCOUNT2, .Arg2(op_le)),
-        "flatten": Function { argcount: ARGCOUNT0 | ARGCOUNT1, iter: false, callback: .Args(func_flatten) },
-        "_range": Function { argcount: ARGCOUNT3, iter: true, callback: .Args(func_range) },
-        "min": fun(ARGCOUNT0, .Arg0(func_min)),
-        "_min_by": fun(ARGCOUNT1, .Arg1(func_min_by)),
-        "max": fun(ARGCOUNT0, .Arg0(func_max)),
-        "_max_by": fun(ARGCOUNT1, .Arg1(func_max_by)),
-        "sort": fun(ARGCOUNT0, .Arg0(func_sort)),
-        "_sort_by": fun(ARGCOUNT1, .Arg1(func_sort_by)),
-        "_group_by": fun(ARGCOUNT1, .Arg1(func_group_by)),
-        "unique": fun(ARGCOUNT0, .Arg0(func_unique)),
-        "_unique_by": fun(ARGCOUNT1, .Arg1(func_unique_by)),
-        "sin": fun(ARGCOUNT0, .Math1("sin", go_sin)),
-        "cos": fun(ARGCOUNT0, .Math1("cos", go_cos)),
-        "tan": fun(ARGCOUNT0, .Math1("tan", go_tan)),
-        "asin": fun(ARGCOUNT0, .Math1("asin", go_asin)),
-        "acos": fun(ARGCOUNT0, .Math1("acos", go_acos)),
-        "atan": fun(ARGCOUNT0, .Math1("atan", go_atan)),
-        "sinh": fun(ARGCOUNT0, .Math1("sinh", gomath.sinh)),
-        "cosh": fun(ARGCOUNT0, .Math1("cosh", gomath.cosh)),
-        "tanh": fun(ARGCOUNT0, .Math1("tanh", gomath.tanh)),
-        "asinh": fun(ARGCOUNT0, .Math1("asinh", gomath.asinh)),
-        "acosh": fun(ARGCOUNT0, .Math1("acosh", gomath.acosh)),
-        "atanh": fun(ARGCOUNT0, .Math1("atanh", gomath.atanh)),
-        "floor": fun(ARGCOUNT0, .Math1("floor", go_floor)),
-        "round": fun(ARGCOUNT0, .Math1("round", math.round)),
-        "nearbyint": fun(ARGCOUNT0, .Math1("nearbyint", go_round_to_even)),
-        "rint": fun(ARGCOUNT0, .Math1("rint", go_round_to_even)),
-        "ceil": fun(ARGCOUNT0, .Math1("ceil", go_ceil)),
-        "trunc": fun(ARGCOUNT0, .Math1("trunc", go_trunc)),
-        "significand": fun(ARGCOUNT0, .Math1("significand", func_significand)),
-        "fabs": fun(ARGCOUNT0, .Math1("fabs", go_abs)),
-        "sqrt": fun(ARGCOUNT0, .Math1("sqrt", go_sqrt)),
-        "cbrt": fun(ARGCOUNT0, .Math1("cbrt", gomath.cbrt)),
-        "exp": fun(ARGCOUNT0, .Math1("exp", go_exp)),
-        "exp10": fun(ARGCOUNT0, .Math1("exp10", func_exp10)),
-        "exp2": fun(ARGCOUNT0, .Math1("exp2", go_exp2)),
-        "expm1": fun(ARGCOUNT0, .Math1("expm1", gomath.expm1)),
-        "frexp": fun(ARGCOUNT0, .Arg0(func_frexp)),
-        "modf": fun(ARGCOUNT0, .Arg0(func_modf)),
-        "log": fun(ARGCOUNT0, .Math1("log", go_log)),
-        "log10": fun(ARGCOUNT0, .Math1("log10", go_log10)),
-        "log1p": fun(ARGCOUNT0, .Math1("log1p", gomath.log1p)),
-        "log2": fun(ARGCOUNT0, .Math1("log2", go_log2)),
-        "logb": fun(ARGCOUNT0, .Math1("logb", gomath.logb)),
-        "gamma": fun(ARGCOUNT0, .Math1("gamma", gomath.gamma)),
-        "tgamma": fun(ARGCOUNT0, .Math1("tgamma", gomath.gamma)),
-        "lgamma": fun(ARGCOUNT0, .Math1("lgamma", func_lgamma)),
-        "erf": fun(ARGCOUNT0, .Math1("erf", gomath.erf)),
-        "erfc": fun(ARGCOUNT0, .Math1("erfc", gomath.erfc)),
-        "j0": fun(ARGCOUNT0, .Math1("j0", gomath.j0)),
-        "j1": fun(ARGCOUNT0, .Math1("j1", gomath.j1)),
-        "y0": fun(ARGCOUNT0, .Math1("y0", gomath.y0)),
-        "y1": fun(ARGCOUNT0, .Math1("y1", gomath.y1)),
-        "atan2": fun(ARGCOUNT2, .Math2("atan2", go_atan2)),
-        "copysign": fun(ARGCOUNT2, .Math2("copysign", go_copysign)),
-        "drem": fun(ARGCOUNT2, .Math2("drem", func_drem)),
-        "fdim": fun(ARGCOUNT2, .Math2("fdim", math.dim)),
-        "fmax": fun(ARGCOUNT2, .Math2("fmax", func_fmax)),
-        "fmin": fun(ARGCOUNT2, .Math2("fmin", func_fmin)),
-        "fmod": fun(ARGCOUNT2, .Math2("fmod", gomath.mod)),
-        "hypot": fun(ARGCOUNT2, .Math2("hypot", gomath.hypot)),
-        "jn": fun(ARGCOUNT2, .Math2("jn", func_jn)),
-        "nextafter": fun(ARGCOUNT2, .Math2("nextafter", gomath.nextafter)),
-        "nexttoward": fun(ARGCOUNT2, .Math2("nexttoward", gomath.nextafter)),
-        "remainder": fun(ARGCOUNT2, .Math2("remainder", gomath.remainder)),
-        "ldexp": fun(ARGCOUNT2, .Math2("ldexp", func_ldexp)),
-        "scalb": fun(ARGCOUNT2, .Math2("scalb", func_ldexp)),
-        "scalbln": fun(ARGCOUNT2, .Math2("scalbln", func_ldexp)),
-        "yn": fun(ARGCOUNT2, .Math2("yn", func_yn)),
-        "pow": fun(ARGCOUNT2, .Math2("pow", gomath.pow)),
-        "fma": Function { argcount: ARGCOUNT3, iter: false, callback: .Math3("fma", gomath.fma) },
-        "infinite": fun(ARGCOUNT0, .Arg0(func_infinite)),
-        "isfinite": fun(ARGCOUNT0, .Arg0(func_isfinite)),
-        "isinfinite": fun(ARGCOUNT0, .Arg0(func_isinfinite)),
-        "nan": fun(ARGCOUNT0, .Arg0(func_nan)),
-        "isnan": fun(ARGCOUNT0, .Arg0(func_isnan)),
-        "isnormal": fun(ARGCOUNT0, .Arg0(func_isnormal)),
-        "setpath": fun(ARGCOUNT2, .Arg2(func_setpath)),
-        "delpaths": fun(ARGCOUNT1, .Arg1(func_delpaths)),
-        "getpath": fun(ARGCOUNT1, .Arg1(func_getpath)),
-        "transpose": fun(ARGCOUNT0, .Arg0(func_transpose)),
-        "bsearch": fun(ARGCOUNT1, .Arg1(func_bsearch)),
-        "gmtime": fun(ARGCOUNT0, .Arg0(func_gmtime)),
-        "localtime": local(ARGCOUNT0, "localtime"),
-        "mktime": fun(ARGCOUNT0, .Arg0(func_mktime)),
-        "strftime": fun(ARGCOUNT1, .Arg1(func_strftime)),
-        "strflocaltime": local(ARGCOUNT1, "strflocaltime"),
-        "strptime": local(ARGCOUNT1, "strptime"),
-        "now": local(ARGCOUNT0, "now"),
-        "_match": Function { argcount: ARGCOUNT3, iter: false, callback: .Nil },
-        "_captures": fun(ARGCOUNT0, .Arg0(func_captures)),
-        "error": Function { argcount: ARGCOUNT0 | ARGCOUNT1, iter: false, callback: .Args(func_error) },
-        "halt": fun(ARGCOUNT0, .Arg0(func_halt)),
-        "halt_error": Function { argcount: ARGCOUNT0 | ARGCOUNT1, iter: false, callback: .Args(func_halt_error) },
+        "empty": nil_func(ARGCOUNT0),
+        "path": nil_func(ARGCOUNT1),
+        "env": nil_func(ARGCOUNT0),
+        "builtins": nil_func(ARGCOUNT0),
+        "input": nil_func(ARGCOUNT0),
+        "modulemeta": nil_func(ARGCOUNT0),
+        "debug": nil_func(ARGCOUNT1),
+        "length": arg_func0(func_length),
+        "utf8bytelength": arg_func0(func_utf8_byte_length),
+        "keys": arg_func0(func_keys),
+        "has": arg_func1(func_has),
+        "add": arg_func0(func_add),
+        "toboolean": arg_func0(func_to_boolean),
+        "tonumber": arg_func0(func_to_number),
+        "tostring": arg_func0(func_to_string),
+        "type": arg_func0(func_type),
+        "reverse": arg_func0(func_reverse),
+        "contains": arg_func1(func_contains),
+        "inside": arg_func1(func_inside),
+        "indices": arg_func1(func_indices),
+        "index": arg_func1(func_index),
+        "rindex": arg_func1(func_rindex),
+        "startswith": arg_func1(func_starts_with),
+        "endswith": arg_func1(func_ends_with),
+        "ltrimstr": arg_func1(func_ltrimstr),
+        "rtrimstr": arg_func1(func_rtrimstr),
+        "trimstr": arg_func1(func_trimstr),
+        "ltrim": arg_func0(func_ltrim),
+        "rtrim": arg_func0(func_rtrim),
+        "trim": arg_func0(func_trim),
+        "explode": arg_func0(func_explode),
+        "implode": arg_func0(func_implode),
+        "split": arg_func1(func_split),
+        "join": arg_func1(func_join),
+        "ascii_downcase": arg_func0(func_ascii_downcase),
+        "ascii_upcase": arg_func0(func_ascii_upcase),
+        "tojson": arg_func0(func_to_json),
+        "fromjson": arg_func0(func_from_json),
+        "format": arg_func1(func_format),
+        "_tohtml": arg_func0(func_to_html),
+        "_touri": arg_func0(func_to_uri),
+        "_tourid": arg_func0(func_to_urid),
+        "_tocsv": arg_func0(func_to_csv),
+        "_totsv": arg_func0(func_to_tsv),
+        "_tosh": arg_func0(func_to_sh),
+        "_tobase64": arg_func0(func_to_base64),
+        "_tobase64d": arg_func0(func_to_base64d),
+        "_index": arg_func2(func_index2),
+        "_slice": arg_func3(func_slice),
+        "_plus": arg_func0(func_op_plus_item),
+        "_negate": arg_func0(func_op_negate_item),
+        "_add": arg_func2(op_add),
+        "_subtract": arg_func2(op_sub),
+        "_multiply": arg_func2(op_mul),
+        "_divide": arg_func2(op_div),
+        "_modulo": arg_func2(op_mod),
+        "_alternative": arg_func2(op_alt),
+        "_equal": arg_func2(op_eq),
+        "_notequal": arg_func2(op_ne),
+        "_greater": arg_func2(op_gt),
+        "_less": arg_func2(op_lt),
+        "_greatereq": arg_func2(op_ge),
+        "_lesseq": arg_func2(op_le),
+        "flatten": args_func(ARGCOUNT0 | ARGCOUNT1, false, func_flatten),
+        "_range": args_func(ARGCOUNT3, true, func_range),
+        "min": arg_func0(func_min),
+        "_min_by": arg_func1(func_min_by),
+        "max": arg_func0(func_max),
+        "_max_by": arg_func1(func_max_by),
+        "sort": arg_func0(func_sort),
+        "_sort_by": arg_func1(func_sort_by),
+        "_group_by": arg_func1(func_group_by),
+        "unique": arg_func0(func_unique),
+        "_unique_by": arg_func1(func_unique_by),
+        "sin": math_func("sin", go_sin),
+        "cos": math_func("cos", go_cos),
+        "tan": math_func("tan", go_tan),
+        "asin": math_func("asin", go_asin),
+        "acos": math_func("acos", go_acos),
+        "atan": math_func("atan", go_atan),
+        "sinh": math_func("sinh", gomath.sinh),
+        "cosh": math_func("cosh", gomath.cosh),
+        "tanh": math_func("tanh", gomath.tanh),
+        "asinh": math_func("asinh", gomath.asinh),
+        "acosh": math_func("acosh", gomath.acosh),
+        "atanh": math_func("atanh", gomath.atanh),
+        "floor": math_func("floor", go_floor),
+        "round": math_func("round", math.round),
+        "nearbyint": math_func("nearbyint", go_round_to_even),
+        "rint": math_func("rint", go_round_to_even),
+        "ceil": math_func("ceil", go_ceil),
+        "trunc": math_func("trunc", go_trunc),
+        "significand": math_func("significand", func_significand),
+        "fabs": math_func("fabs", go_abs),
+        "sqrt": math_func("sqrt", go_sqrt),
+        "cbrt": math_func("cbrt", gomath.cbrt),
+        "exp": math_func("exp", go_exp),
+        "exp10": math_func("exp10", func_exp10),
+        "exp2": math_func("exp2", go_exp2),
+        "expm1": math_func("expm1", gomath.expm1),
+        "frexp": arg_func0(func_frexp),
+        "modf": arg_func0(func_modf),
+        "log": math_func("log", go_log),
+        "log10": math_func("log10", go_log10),
+        "log1p": math_func("log1p", gomath.log1p),
+        "log2": math_func("log2", go_log2),
+        "logb": math_func("logb", gomath.logb),
+        "gamma": math_func("gamma", gomath.gamma),
+        "tgamma": math_func("tgamma", gomath.gamma),
+        "lgamma": math_func("lgamma", func_lgamma),
+        "erf": math_func("erf", gomath.erf),
+        "erfc": math_func("erfc", gomath.erfc),
+        "j0": math_func("j0", gomath.j0),
+        "j1": math_func("j1", gomath.j1),
+        "y0": math_func("y0", gomath.y0),
+        "y1": math_func("y1", gomath.y1),
+        "atan2": math_func2("atan2", go_atan2),
+        "copysign": math_func2("copysign", go_copysign),
+        "drem": math_func2("drem", func_drem),
+        "fdim": math_func2("fdim", math.dim),
+        "fmax": math_func2("fmax", func_fmax),
+        "fmin": math_func2("fmin", func_fmin),
+        "fmod": math_func2("fmod", gomath.mod),
+        "hypot": math_func2("hypot", gomath.hypot),
+        "jn": math_func2("jn", func_jn),
+        "nextafter": math_func2("nextafter", gomath.nextafter),
+        "nexttoward": math_func2("nexttoward", gomath.nextafter),
+        "remainder": math_func2("remainder", gomath.remainder),
+        "ldexp": math_func2("ldexp", func_ldexp),
+        "scalb": math_func2("scalb", func_ldexp),
+        "scalbln": math_func2("scalbln", func_ldexp),
+        "yn": math_func2("yn", func_yn),
+        "pow": math_func2("pow", gomath.pow),
+        "fma": math_func3("fma", gomath.fma),
+        "infinite": arg_func0(func_infinite),
+        "isfinite": arg_func0(func_isfinite),
+        "isinfinite": arg_func0(func_isinfinite),
+        "nan": arg_func0(func_nan),
+        "isnan": arg_func0(func_isnan),
+        "isnormal": arg_func0(func_isnormal),
+        "setpath": arg_func2(func_setpath),
+        "delpaths": arg_func1(func_delpaths),
+        "getpath": arg_func1(func_getpath),
+        "transpose": arg_func0(func_transpose),
+        "bsearch": arg_func1(func_bsearch),
+        "gmtime": arg_func0(func_gmtime),
+        "localtime": arg_func0(func_localtime),
+        "mktime": arg_func0(func_mktime),
+        "strftime": arg_func1(func_strftime),
+        "strflocaltime": arg_func1(func_strflocaltime),
+        "strptime": arg_func1(func_strptime),
+        "now": Function { argcount: ARGCOUNT0, iter: false, callback: .Now },
+        "_match": nil_func(ARGCOUNT3),
+        "_captures": arg_func0(func_captures),
+        "error": args_func(ARGCOUNT0 | ARGCOUNT1, false, func_error),
+        "halt": arg_func0(func_halt),
+        "halt_error": args_func(ARGCOUNT0 | ARGCOUNT1, false, func_halt_error),
     }
-
-## Calls the callback of a mathFuncN closure.
-pub fn call_math1(name: string, f: fn(f64) -> f64, v: Value) -> Item:
-    match to_float64(v):
-        .Some(x) => .V(.Float(f(x)))
-        .None => .Err(.Func0Type(name, v))
-
-pub fn call_math2(name: string, f: fn(f64, f64) -> f64, x: Value, y: Value) -> Item:
-    let .Some(l) = to_float64(x) else: return .Err(.Func0Type(name, x))
-    let .Some(r) = to_float64(y) else: return .Err(.Func0Type(name, y))
-    .V(.Float(f(l, r)))
-
-pub fn call_math3(name: string, f: fn(f64, f64, f64) -> f64, a: Value, b: Value, c: Value) -> Item:
-    let .Some(x) = to_float64(a) else: return .Err(.Func0Type(name, a))
-    let .Some(y) = to_float64(b) else: return .Err(.Func0Type(name, b))
-    let .Some(z) = to_float64(c) else: return .Err(.Func0Type(name, c))
-    .V(.Float(f(x, y, z)))
 
 fn res(r: Result[Value, JqError]) -> Item:
     match r:
@@ -1117,7 +1138,7 @@ fn func_isnormal(v: Value) -> Item:
 # ---------------------------------------------------------------- paths
 
 ## funcAllocator
-pub fn func_allocator() -> Item:
+pub fn func_allocator(_v: Item, _args: List[Item]) -> Item:
     .Alloc(box(Allocator {}))
 
 fn allocated(a: (*mut Allocator)?, owner: (*mut Allocator)?, gen: i64) -> bool:
@@ -1467,8 +1488,11 @@ fn func_bsearch(v: Value, t: Value) -> Item:
 fn func_gmtime(v: Value) -> Item:
     time_to_array_func("gmtime", v, time.utc())
 
-fn func_localtime(v: Value, local: *mut Location) -> Item:
-    time_to_array_func("localtime", v, local)
+fn func_localtime(v: Value) -> Item:
+    time_to_array_func("localtime", v, time.local())
+
+fn func_strflocaltime(v: Value, x: Value) -> Item:
+    format_time_func("strflocaltime", v, x, time.local())
 
 fn time_to_array_func(name: string, v: Value, loc: *mut Location) -> Item:
     let .Some(w) = to_float64(v) else: return .Err(.Func0Type(name, v))
@@ -1526,10 +1550,10 @@ fn format_time_func(name: string, v: Value, x: Value, loc: *mut Location) -> Ite
                 .Err(e) => return .Err(.Func1Wrap(name, v, x, box(e)))
     .V(.Str(timefmt.format(t, format)))
 
-fn func_strptime(v: Value, x: Value, local: *mut Location) -> Item:
+fn func_strptime(v: Value, x: Value) -> Item:
     let .Str(s) = v else: return .Err(.Func1Type("strptime", v, x))
     let .Str(format) = x else: return .Err(.Func1Type("strptime", v, x))
-    match timefmt.parse(s, format, local):
+    match timefmt.parse(s, format, time.local()):
         .Ok(t) => .V(time_to_array(t.utc()))
         .Err(e) => .Err(.Func1Wrap("strptime", v, x, box(JqError.Message(e))))
 
@@ -1553,14 +1577,6 @@ fn array_to_time(a: List[Value], loc: *mut Location) -> Result[Time, JqError]:
 ## funcNow, given the current time.
 pub fn func_now(unix_nanos: i64) -> Item:
     .V(.Float(f64(unix_nanos / 1000000000) + f64(unix_nanos % 1000000000) / 1e9))
-
-## The functions reading time.Local.
-pub fn call_local(name: string, v: Value, args: List[Value], local: *mut Location) -> Item:
-    match name:
-        "localtime" => func_localtime(v, local)
-        "strflocaltime" => format_time_func("strflocaltime", v, args[0], local)
-        "strptime" => func_strptime(v, args[0], local)
-        _ => .Err(.Message("unknown local function $name"))
 
 # ---------------------------------------------------------------- regexp
 
